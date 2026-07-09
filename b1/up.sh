@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# b1/up.sh — Start a named Hermes Agent container
-#
-# Usage:  bash b1/up.sh --name
-# First run prompts for API key if not set.
+# b1/up.sh — Start a named Sudo Agent container
+# Usage: bash b1/up.sh --name
 
 B1_DIR="$(cd "$(dirname "$0")" && pwd)"
 NAME=""
@@ -22,10 +20,12 @@ if [[ -z "$NAME" ]]; then
   exit 1
 fi
 
-CONTAINER="hermes-$NAME"
-VOLUME="hermes-$NAME-data"
-ENV_FILE="$HOME/.hermes/.env"
-CONFIG_FILE="$HOME/.hermes/config.yaml"
+CONTAINER="sudo-$NAME"
+VOLUME="sudo-$NAME-data"
+ENV_FILE="$HOME/.sudo-agent/.env"
+CONFIG_FILE="$HOME/.sudo-agent/config.yaml"
+
+mkdir -p "$HOME/.sudo-agent"
 
 # --- 0. Prompt for DeepSeek API key if not set ---
 if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null || \
@@ -45,9 +45,8 @@ if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null || \
     exit 1
   fi
 
-  mkdir -p "$HOME/.hermes"
   echo "" >> "$ENV_FILE"
-  echo "# DeepSeek (set by hermes-b1/up.sh)" >> "$ENV_FILE"
+  echo "# DeepSeek (set by sudo-agent/up.sh)" >> "$ENV_FILE"
   echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY" >> "$ENV_FILE"
 
   if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -69,19 +68,33 @@ EOF
   echo ""
 fi
 
+# --- Generate sudo password if not set ---
+SUDO_PASS=""
+if grep -q '^SUDO_PASSWORD=' "$ENV_FILE" 2>/dev/null; then
+  SUDO_PASS=$(grep '^SUDO_PASSWORD=' "$ENV_FILE" | cut -d'=' -f2)
+fi
+if [[ -z "$SUDO_PASS" ]]; then
+  SUDO_PASS=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 16)
+  echo "" >> "$ENV_FILE"
+  echo "# Sudo password for root inside the container (set by sudo-agent/up.sh)" >> "$ENV_FILE"
+  echo "SUDO_PASSWORD=$SUDO_PASS" >> "$ENV_FILE"
+  echo "✓ Sudo password generated: $SUDO_PASS"
+  echo ""
+fi
+
 # --- 1. Ensure Docker image exists ---
 if ! docker image inspect hermes-agent:latest &>/dev/null; then
-  echo "→ Hermes Agent image not found."
-  echo "  Run setup.sh first, or:"
-  echo "  git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /tmp/hermes"
-  echo "  docker build -t hermes-agent:latest /tmp/hermes"
-  exit 1
+  echo "→ Building Hermes Agent image (first time, takes a few minutes)..."
+  TMP_DIR=$(mktemp -d)
+  git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR" 2>&1
+  docker build -t hermes-agent:latest "$TMP_DIR"
+  rm -rf "$TMP_DIR"
+  echo "✓ Image built"
 fi
 
 # --- 2. Ensure volume exists ---
 if ! docker volume inspect "$VOLUME" &>/dev/null; then
   docker volume create "$VOLUME" >/dev/null
-  # Seed volume with correct ownership so hermes user can write
   docker run --rm -v "$VOLUME:/opt/data" alpine chown -R "$(id -u):$(id -g)" /opt/data 2>/dev/null || true
 fi
 
@@ -112,7 +125,11 @@ docker run -d \
 
 echo "✓ $CONTAINER is running"
 echo ""
-echo "  Enter:  bash $B1_DIR/enter.sh --$NAME"
+echo "  Talk:   bash $B1_DIR/enter.sh --$NAME"
 echo "  Shell:  bash $B1_DIR/ssh.sh --$NAME"
 echo "  Stop:   bash $B1_DIR/down.sh --$NAME"
 echo "  Logs:   docker logs $CONTAINER -f"
+echo ""
+echo "  Agent has full sudo inside its container."
+echo "  It can install packages, modify configs, destroy itself."
+echo "  It cannot escape the container."

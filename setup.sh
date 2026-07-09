@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# hermes-b1/setup.sh — One-time setup: builds the Hermes Agent Docker image
+# sudo-agent/setup.sh — One-time setup: builds the Hermes Agent Docker image
 # and prompts for your DeepSeek API key.
-#
-# Usage: bash setup.sh
 
 echo "┌─────────────────────────────────────────────┐"
-echo "│  hermes-b1 — Hermes Agent in a Box          │"
+echo "│  sudo-agent — Hermes Agent with root cage   │"
 echo "└─────────────────────────────────────────────┘"
 echo ""
 
@@ -24,19 +22,18 @@ if docker image inspect hermes-agent:latest &>/dev/null; then
 else
   echo "→ Cloning Hermes Agent repo..."
   TMP_DIR=$(mktemp -d)
-  git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR" 2>&1
+  git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR"
 
   echo "→ Building Docker image (this takes a few minutes)..."
-  docker build -t hermes-agent:latest "$TMP_DIR" 2>&1
+  docker build -t hermes-agent:latest "$TMP_DIR"
   rm -rf "$TMP_DIR"
   echo "✓ Image built"
 fi
 
 # --- Prompt for DeepSeek API key ---
-ENV_FILE="$HOME/.hermes/.env"
-CONFIG_FILE="$HOME/.hermes/config.yaml"
-
-mkdir -p "$HOME/.hermes"
+ENV_FILE="$HOME/.sudo-agent/.env"
+CONFIG_FILE="$HOME/.sudo-agent/config.yaml"
+mkdir -p "$HOME/.sudo-agent"
 
 if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null || \
      grep -q '^DEEPSEEK_API_KEY=\s*$' "$ENV_FILE" 2>/dev/null; then
@@ -56,14 +53,13 @@ if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null || \
   fi
 
   echo "" >> "$ENV_FILE"
-  echo "# DeepSeek (set by hermes-b1)" >> "$ENV_FILE"
+  echo "# DeepSeek (set by sudo-agent/setup.sh)" >> "$ENV_FILE"
   echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY" >> "$ENV_FILE"
 fi
 
 # --- Ensure config.yaml has DeepSeek settings ---
 if [[ ! -f "$CONFIG_FILE" ]]; then
   cat > "$CONFIG_FILE" << 'CONFIGEOF'
-# hermes-b1 config
 model:
   default: "deepseek-chat"
   provider: "custom"
@@ -81,6 +77,6 @@ echo ""
 echo "✓ Setup complete"
 echo ""
 echo "Next steps:"
-echo "  bash b1/up.sh --fish      # start agent 'fish'"
+echo "  bash b1/up.sh --fish      # start agent 'fish' (generates sudo password)"
 echo "  bash b1/enter.sh --fish   # talk to agent"
 echo "  bash b1/down.sh --fish    # stop agent"
