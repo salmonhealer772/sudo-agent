@@ -75,6 +75,7 @@ memory:
   memory_enabled: true
   user_profile_enabled: true
   write_approval: false
+  nudge_interval: 1
 EOF
   else
     sed -i 's|^  default:.*|  default: "deepseek-chat"|' "$CONFIG_FILE"
@@ -89,6 +90,7 @@ memory:
   memory_enabled: true
   user_profile_enabled: true
   write_approval: false
+  nudge_interval: 1
 
 terminal:
   sudo_password_env: "SUDO_PASSWORD"
