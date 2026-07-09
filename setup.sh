@@ -65,18 +65,20 @@ model:
   provider: "custom"
   base_url: "https://api.deepseek.com/v1"
 terminal:
+  backend: "local"
+  sudo_password_env: "SUDO_PASSWORD"
 memory:
   memory_char_limit: 100000
   user_char_limit: 50000
   memory_enabled: true
   user_profile_enabled: true
   write_approval: false
-  backend: "docker"
 CONFIGEOF
 else
   sed -i 's|^  default:.*|  default: "deepseek-chat"|' "$CONFIG_FILE"
   sed -i 's|^  provider:.*|  provider: "custom"|' "$CONFIG_FILE"
   sed -i 's|^  base_url:.*|  base_url: "https://api.deepseek.com/v1"|' "$CONFIG_FILE"
+  sed -i 's|^  backend:.*|  backend: "local"|' "$CONFIG_FILE"
 fi
 
 echo ""

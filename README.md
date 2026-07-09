@@ -6,7 +6,7 @@
 
 - **Auto memory** — everything you tell it gets stored. No commands, no prompts, no opt-in.
 - **Auto recall** — relevant context appears when you need it. Start a new session, it remembers.
-- **Full sudo** — the agent has root access inside its own container. Can `apt install`, edit configs, `rm -rf /*`, do whatever it wants.
+- **Full sudo** — the agent has root access inside its own container. Can `apt install`, `sudo` anything, edit configs, `rm -rf /*`, do whatever it wants.
 - **Zero escape** — cannot reach the host. Even with full sudo, Docker is the boundary. Nothing leaves the container.
 - **Multi-agent** — run alice, bob, charlie in parallel. Each gets its own container, brain, memory, and sudo password.
 - **CLI in the container** — git, docker-cli, openssh, python, node, ripgrep, ffmpeg, Playwright. Full terminal.
