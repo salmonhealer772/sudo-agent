@@ -113,14 +113,20 @@ if [[ -z "$SUDO_PASS" ]]; then
   echo ""
 fi
 
-# --- 1. Build Docker image if missing ---
-if ! docker image inspect hermes-agent:latest &>/dev/null; then
-  echo "→ Hermes image not found. Building (3-5 min)..."
-  TMP_DIR=$(mktemp -d) || { echo "Failed to create temp dir"; exit 1; }
-  git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR" || { echo "Git clone failed. Check internet."; exit 1; }
-  docker build -t hermes-agent:latest "$TMP_DIR" || { echo "Docker build failed."; exit 1; }
-  rm -rf "$TMP_DIR"
-  echo "✓ Image built"
+# --- 1. Build sudo-agent image if missing ---
+REPO_DIR="$(cd "$(dirname "$0")" && cd .. && pwd)"
+if ! docker image inspect sudo-agent:latest &>/dev/null; then
+  if ! docker image inspect hermes-agent:latest &>/dev/null; then
+    echo "→ Hermes base image not found. Building (3-5 min)..."
+    TMP_DIR=$(mktemp -d) || { echo "Failed to create temp dir"; exit 1; }
+    git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR" || { echo "Git clone failed. Check internet."; exit 1; }
+    docker build -t hermes-agent:latest "$TMP_DIR" || { echo "Docker build failed."; exit 1; }
+    rm -rf "$TMP_DIR"
+    echo "✓ Hermes base image built"
+  fi
+  echo "→ Building sudo-agent image (adds sudo)..."
+  docker build -t sudo-agent:latest -f "$REPO_DIR/Dockerfile" "$REPO_DIR" || { echo "Sudo-agent build failed."; exit 1; }
+  echo "✓ sudo-agent image built"
 fi
 
 # --- 2. Ensure volume exists ---
@@ -152,7 +158,7 @@ docker run -d \
   -v "$VOLUME:/opt/data" \
   -v "$CONFIG_FILE:/opt/data/config.yaml" \
   $ENV_OPTS \
-  hermes-agent:latest gateway run
+  sudo-agent:latest gateway run
 
 echo "✓ $CONTAINER is running"
 echo ""

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
-# sudo-agent/setup.sh — One-time setup: builds the Hermes Agent Docker image
-# and prompts for your DeepSeek API key.
+# sudo-agent/setup.sh — One-time setup: builds Docker image, prompts for DeepSeek API key.
 
 echo "┌─────────────────────────────────────────────┐"
 echo "│  sudo-agent — Hermes Agent with root cage   │"
@@ -16,18 +15,22 @@ if ! docker info &>/dev/null; then
   exit 1
 fi
 
-# --- Check if image already exists ---
-if docker image inspect hermes-agent:latest &>/dev/null; then
-  echo "✓ Hermes Agent Docker image already built."
-else
-  echo "→ Cloning Hermes Agent repo..."
-  TMP_DIR=$(mktemp -d)
-  git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-  echo "→ Building Docker image (this takes a few minutes)..."
-  docker build -t hermes-agent:latest "$TMP_DIR"
+# --- Build image ---
+if docker image inspect sudo-agent:latest &>/dev/null; then
+  echo "✓ sudo-agent image already built."
+else
+  echo "→ Building base Hermes Agent image (3-5 min)..."
+  TMP_DIR=$(mktemp -d) || { echo "Failed to create temp dir"; exit 1; }
+  git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR" || { echo "Git clone failed. Check internet."; exit 1; }
+  docker build -t hermes-agent:latest "$TMP_DIR" || { echo "Docker build failed."; exit 1; }
   rm -rf "$TMP_DIR"
-  echo "✓ Image built"
+  echo "✓ Base image built"
+
+  echo "→ Building sudo-agent image (adds sudo)..."
+  docker build -t sudo-agent:latest -f "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR" || { echo "Sudo-agent build failed."; exit 1; }
+  echo "✓ sudo-agent image built"
 fi
 
 # --- Prompt for DeepSeek API key ---
@@ -57,7 +60,7 @@ if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null || \
   echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY" >> "$ENV_FILE"
 fi
 
-# --- Ensure config.yaml has DeepSeek settings ---
+# --- Ensure config.yaml ---
 if [[ ! -f "$CONFIG_FILE" ]]; then
   cat > "$CONFIG_FILE" << 'CONFIGEOF'
 model:
@@ -84,7 +87,6 @@ fi
 echo ""
 echo "✓ Setup complete"
 echo ""
-echo "Next steps:"
-echo "  bash scripts/up.sh --fish      # start agent 'fish' (generates sudo password)"
-echo "  bash scripts/talk.sh --fish   # talk to agent"
+echo "  bash scripts/up.sh --fish      # start agent (generates sudo password)"
+echo "  bash scripts/talk.sh --fish    # talk to agent"
 echo "  bash scripts/down.sh --fish    # stop agent"
