@@ -38,6 +38,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 mkdir -p "$HOME/.sudo-agent"
 
+# Guard: if config.yaml is somehow a directory (Docker bind-mount bug), remove it
+if [[ -d "$CONFIG_FILE" ]]; then
+  rm -rf "$CONFIG_FILE"
+fi
+
 # --- 0. Prompt for DeepSeek API key if not set ---
 if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null || \
      grep -q '^DEEPSEEK_API_KEY=\s*$' "$ENV_FILE" 2>/dev/null; then
