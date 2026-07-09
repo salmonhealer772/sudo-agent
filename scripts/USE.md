@@ -6,7 +6,7 @@ bash setup.sh                               # builds image, asks for DeepSeek ke
 
 # Then:
 bash scripts/up.sh --alice                  # start alice
-bash scripts/enter.sh --alice               # talk to alice
+bash scripts/talk.sh --alice               # talk to alice
 bash scripts/ssh.sh --alice                 # root shell in alice
 bash scripts/down.sh --alice                # stop alice
 bash scripts/rm-containers.sh --alice       # nuke just alice

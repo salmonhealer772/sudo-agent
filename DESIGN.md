@@ -10,7 +10,7 @@ One command. Hermes Agent on DeepSeek — contained in Docker. Multiple agents b
 |---|---|---|
 | `setup.sh` | One-time: builds Docker image, prompts for DeepSeek API key | Run once per machine |
 | `scripts/up.sh --name` | Create or restart `sudo-{name}` container | Generates sudo password on first run |
-| `scripts/enter.sh --name` | `docker exec -it sudo-{name} hermes` | Talks to the agent |
+| `scripts/talk.sh --name` | `docker exec -it sudo-{name} hermes` | Talks to the agent |
 | `scripts/ssh.sh --name` | `docker exec -it sudo-{name} bash` | Root shell |
 | `scripts/down.sh --name` | Stop `sudo-{name}`, volume persists | Memory survives |
 | `scripts/rm-containers.sh --name` | Force-remove one container | — |

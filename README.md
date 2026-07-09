@@ -20,7 +20,7 @@ bash setup.sh              # builds image, asks for DeepSeek API key once
 
 ```bash
 bash scripts/up.sh --alice      # create or restart "alice" (generates sudo password)
-bash scripts/enter.sh --alice   # talk to "alice"
+bash scripts/talk.sh --alice   # talk to "alice"
 bash scripts/ssh.sh --alice     # root shell — no password needed
 bash scripts/down.sh --alice    # stop "alice" (memory persists)
 bash scripts/rm-containers.sh --ALL  # kill all sudo-* containers
@@ -31,8 +31,8 @@ Multiple agents:
 ```bash
 bash scripts/up.sh --alice
 bash scripts/up.sh --bob
-bash scripts/enter.sh --alice   # talks to alice
-bash scripts/enter.sh --bob     # talks to bob
+bash scripts/talk.sh --alice   # talks to alice
+bash scripts/talk.sh --bob     # talks to bob
 ```
 
 Each name → own container, own volume, own memory, own sudo.

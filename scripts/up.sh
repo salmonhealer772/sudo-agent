@@ -136,7 +136,7 @@ docker run -d \
 
 echo "✓ $CONTAINER is running"
 echo ""
-echo "  Talk:   bash $SCRIPT_DIR/enter.sh --$NAME"
+echo "  Talk:   bash $SCRIPT_DIR/talk.sh --$NAME"
 echo "  Shell:  bash $SCRIPT_DIR/ssh.sh --$NAME"
 echo "  Stop:   bash $SCRIPT_DIR/down.sh --$NAME"
 echo "  Logs:   docker logs $CONTAINER -f"
