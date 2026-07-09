@@ -79,7 +79,11 @@ if ! docker image inspect hermes-agent:latest &>/dev/null; then
 fi
 
 # --- 2. Ensure volume exists ---
-docker volume inspect "$VOLUME" &>/dev/null || docker volume create "$VOLUME" >/dev/null
+if ! docker volume inspect "$VOLUME" &>/dev/null; then
+  docker volume create "$VOLUME" >/dev/null
+  # Seed volume with correct ownership so hermes user can write
+  docker run --rm -v "$VOLUME:/opt/data" alpine chown -R "$(id -u):$(id -g)" /opt/data 2>/dev/null || true
+fi
 
 # --- 3. Remove existing container ---
 docker container inspect "$CONTAINER" &>/dev/null && docker rm -f "$CONTAINER" >/dev/null
