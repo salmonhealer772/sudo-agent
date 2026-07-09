@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 # scripts/up.sh — Start a named Sudo Agent container
 # Usage: bash scripts/up.sh --name
 
-B1_DIR="$(cd "$(dirname "$0")" && pwd)"
 NAME=""
+
+echo ""
+echo "┌─────────────────────────────────────────────┐"
+echo "│  sudo-agent — starting up                   │"
+echo "└─────────────────────────────────────────────┘"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -20,6 +24,7 @@ if [[ -z "$NAME" ]]; then
   exit 1
 fi
 
+# bash 4.0+ feature guard
 if [[ "${NAME,,}" == "all" ]]; then
   echo "'--ALL' is reserved for rm-containers.sh. Pick a different name." >&2
   exit 1
@@ -29,6 +34,7 @@ CONTAINER="sudo-$NAME"
 VOLUME="sudo-$NAME-data"
 ENV_FILE="$HOME/.sudo-agent/.env"
 CONFIG_FILE="$HOME/.sudo-agent/config.yaml"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 mkdir -p "$HOME/.sudo-agent"
 
@@ -87,19 +93,19 @@ if [[ -z "$SUDO_PASS" ]]; then
   echo ""
 fi
 
-# --- 1. Ensure Docker image exists ---
+# --- 1. Build Docker image if missing ---
 if ! docker image inspect hermes-agent:latest &>/dev/null; then
-  echo "→ Building Hermes Agent image (first time, takes a few minutes)..."
-  TMP_DIR=$(mktemp -d)
-  git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR" 2>&1
-  docker build -t hermes-agent:latest "$TMP_DIR"
+  echo "→ Hermes image not found. Building (3-5 min)..."
+  TMP_DIR=$(mktemp -d) || { echo "Failed to create temp dir"; exit 1; }
+  git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR" || { echo "Git clone failed. Check internet."; exit 1; }
+  docker build -t hermes-agent:latest "$TMP_DIR" || { echo "Docker build failed."; exit 1; }
   rm -rf "$TMP_DIR"
   echo "✓ Image built"
 fi
 
 # --- 2. Ensure volume exists ---
 if ! docker volume inspect "$VOLUME" &>/dev/null; then
-  docker volume create "$VOLUME" >/dev/null
+  docker volume create "$VOLUME" >/dev/null || { echo "Volume create failed"; exit 1; }
   docker run --rm -v "$VOLUME:/opt/data" alpine chown -R "$(id -u):$(id -g)" /opt/data 2>/dev/null || true
 fi
 
@@ -130,11 +136,10 @@ docker run -d \
 
 echo "✓ $CONTAINER is running"
 echo ""
-echo "  Talk:   bash $B1_DIR/enter.sh --$NAME"
-echo "  Shell:  bash $B1_DIR/ssh.sh --$NAME"
-echo "  Stop:   bash $B1_DIR/down.sh --$NAME"
+echo "  Talk:   bash $SCRIPT_DIR/enter.sh --$NAME"
+echo "  Shell:  bash $SCRIPT_DIR/ssh.sh --$NAME"
+echo "  Stop:   bash $SCRIPT_DIR/down.sh --$NAME"
 echo "  Logs:   docker logs $CONTAINER -f"
 echo ""
 echo "  Agent has full sudo inside its container."
-echo "  It can install packages, modify configs, destroy itself."
 echo "  It cannot escape the container."
