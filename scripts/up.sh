@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# b1/up.sh — Start a named Sudo Agent container
-# Usage: bash b1/up.sh --name
+# scripts/up.sh — Start a named Sudo Agent container
+# Usage: bash scripts/up.sh --name
 
 B1_DIR="$(cd "$(dirname "$0")" && pwd)"
 NAME=""
@@ -10,13 +10,18 @@ NAME=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name|--*)  NAME="${1#--}"; shift ;;
-    *)           echo "Usage: bash b1/up.sh --name" >&2; exit 1 ;;
+    *)           echo "Usage: bash scripts/up.sh --name" >&2; exit 1 ;;
   esac
 done
 
 if [[ -z "$NAME" ]]; then
-  echo "Usage: bash b1/up.sh --name" >&2
-  echo "Example: bash b1/up.sh --alice" >&2
+  echo "Usage: bash scripts/up.sh --name" >&2
+  echo "Example: bash scripts/up.sh --alice" >&2
+  exit 1
+fi
+
+if [[ "${NAME,,}" == "all" ]]; then
+  echo "'--ALL' is reserved for rm-containers.sh. Pick a different name." >&2
   exit 1
 fi
 
