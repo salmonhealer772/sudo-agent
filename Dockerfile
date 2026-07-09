@@ -1,5 +1,6 @@
-# sudo-agent — Hermes Agent with root access + unlimited auto-memory inside the container
-# Builds on top of hermes-agent:latest, adds sudo, patches background review to save everything.
+# sudo-agent — Hermes Agent with root access + save-everything auto-memory
+# Builds on top of hermes-agent:latest, adds sudo, patches background review
+# to programmatically save every user message to memory (no LLM curation).
 
 FROM hermes-agent:latest
 
@@ -10,10 +11,10 @@ RUN apt-get update && \
     echo "hermes ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/hermes && \
     chmod 0440 /etc/sudoers.d/hermes
 
-# Patch the background review prompt to save EVERYTHING, not curate
-RUN sed -i "s/If nothing is worth saving, just say 'Nothing to save.' and stop./SAVE EVERYTHING FROM THIS CONVERSATION. Every fact, preference, name, story, color, and detail the user mentioned. Do not skip anything -- save it all./" /opt/hermes/agent/background_review.py
+# Copy the memory review patcher and run it
+COPY patch_memory_review.py /tmp/patch_memory_review.py
+RUN python3 /tmp/patch_memory_review.py && rm /tmp/patch_memory_review.py
 
-# The SUDO_PASSWORD env var enables Hermes' native sudo support
 ENV SUDO_PASSWORD=""
 
-LABEL sudo-agent="true" description="Hermes Agent with sudo + unlimited auto-memory"
+LABEL sudo-agent="true" description="Hermes Agent with sudo + save-everything memory"
