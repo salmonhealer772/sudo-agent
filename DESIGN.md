@@ -31,7 +31,7 @@ One command. Hermes Agent on DeepSeek — contained in Docker. Multiple agents b
 
 - Hermes Agent gateway running (background)
 - DeepSeek via custom OpenAI-compatible endpoint (`api.deepseek.com/v1`)
-- Auto memory (MEMORY.md ~800 tokens + USER.md ~500 tokens injected at session start)
+- Auto memory (MEMORY.md 100k chars + USER.md 50k chars tokens injected at session start)
 - Session search (FTS5) for older conversations
 - `SUDO_PASSWORD` env var set — agent can `sudo` anything
 - **Cannot reach the host** — Docker security boundary

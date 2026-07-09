@@ -65,6 +65,12 @@ model:
   provider: "custom"
   base_url: "https://api.deepseek.com/v1"
 terminal:
+memory:
+  memory_char_limit: 100000
+  user_char_limit: 50000
+  memory_enabled: true
+  user_profile_enabled: true
+  write_approval: false
   backend: "docker"
 CONFIGEOF
 else
