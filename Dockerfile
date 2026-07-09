@@ -7,7 +7,7 @@ FROM hermes-agent:latest
 RUN apt-get update && \
     apt-get install -y --no-install-recommends sudo && \
     rm -rf /var/lib/apt/lists/* && \
-    echo "hermes ALL=(ALL) ALL" >> /etc/sudoers.d/hermes && \
+    echo "hermes ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/hermes && \
     chmod 0440 /etc/sudoers.d/hermes
 
 # The SUDO_PASSWORD env var enables Hermes' native sudo support

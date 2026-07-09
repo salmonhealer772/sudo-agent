@@ -17,21 +17,19 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# --- Build image ---
-if docker image inspect sudo-agent:latest &>/dev/null; then
-  echo "✓ sudo-agent image already built."
-else
+# --- Build images ---
+if ! docker image inspect hermes-agent:latest &>/dev/null; then
   echo "→ Building base Hermes Agent image (3-5 min)..."
   TMP_DIR=$(mktemp -d) || { echo "Failed to create temp dir"; exit 1; }
   git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR" || { echo "Git clone failed. Check internet."; exit 1; }
   docker build -t hermes-agent:latest "$TMP_DIR" || { echo "Docker build failed."; exit 1; }
   rm -rf "$TMP_DIR"
   echo "✓ Base image built"
-
-  echo "→ Building sudo-agent image (adds sudo)..."
-  docker build -t sudo-agent:latest -f "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR" || { echo "Sudo-agent build failed."; exit 1; }
-  echo "✓ sudo-agent image built"
 fi
+
+echo "→ Building sudo-agent image..."
+docker build -t sudo-agent:latest -f "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR" || { echo "Sudo-agent build failed."; exit 1; }
+echo "✓ sudo-agent image built"
 
 # --- Prompt for DeepSeek API key ---
 ENV_FILE="$HOME/.sudo-agent/.env"
