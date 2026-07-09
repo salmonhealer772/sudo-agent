@@ -146,7 +146,7 @@ if [[ -f "$ENV_FILE" ]]; then
   done < <(grep -v '^\s*#' "$ENV_FILE" | grep '=' | grep -v '=\s*$')
 fi
 
-ENV_OPTS+=" -e HERMES_UID=$(id -u) -e HERMES_GID=$(id -g)"
+ENV_OPTS+=" -e HERMES_YOLO_MODE=true -e HERMES_UID=$(id -u) -e HERMES_GID=$(id -g)"
 
 # --- 5. Run container ---
 echo "→ Starting $CONTAINER..."
@@ -167,4 +167,5 @@ echo "  Stop:   bash $SCRIPT_DIR/down.sh --$NAME"
 echo "  Logs:   docker logs $CONTAINER -f"
 echo ""
 echo "  Agent has full sudo inside its container."
+echo "  YOLO mode: dangerous commands auto-approved (HERMES_YOLO_MODE=true)"
 echo "  It cannot escape the container."
