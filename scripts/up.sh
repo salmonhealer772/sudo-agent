@@ -166,6 +166,9 @@ docker run -d \
   $ENV_OPTS \
   sudo-agent:latest gateway run
 
+# Fix any root-owned files in the volume (from s6 init or docker exec)
+docker exec "$CONTAINER" chown -R hermes:hermes /opt/data 2>/dev/null || true
+
 echo "✓ $CONTAINER is running"
 echo ""
 echo "  Talk:   bash $SCRIPT_DIR/talk.sh --$NAME"
