@@ -24,9 +24,11 @@ fi
 
 CONTAINER="sudo-$NAME"
 if docker container inspect "$CONTAINER" &>/dev/null; then
+  echo "→ Committing container state to image..."
+  docker commit "$CONTAINER" sudo-agent:latest >/dev/null
   docker stop "$CONTAINER" >/dev/null
   docker rm "$CONTAINER" >/dev/null
-  echo "✓ $CONTAINER stopped. Memory persists in volume sudo-${NAME}-data."
+  echo "✓ $CONTAINER stopped. Image updated. Memory persists in volume sudo-${NAME}-data."
 else
   echo "→ Container $CONTAINER not running."
 fi
