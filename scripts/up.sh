@@ -131,9 +131,13 @@ if ! docker image inspect hermes-agent:latest &>/dev/null; then
   echo "✓ Hermes base image built"
 fi
 
-echo "→ Building sudo-agent image..."
-docker build -t sudo-agent:latest -f "$REPO_DIR/Dockerfile" "$REPO_DIR" || { echo "Sudo-agent build failed."; exit 1; }
-echo "✓ sudo-agent image built"
+if docker image inspect sudo-agent:latest &>/dev/null; then
+  echo "→ sudo-agent:latest image exists, skipping build"
+else
+  echo "→ Building sudo-agent image..."
+  docker build -t sudo-agent:latest -f "$REPO_DIR/Dockerfile" "$REPO_DIR" || { echo "Sudo-agent build failed."; exit 1; }
+  echo "✓ sudo-agent image built"
+fi
 
 # --- 2. Ensure volume exists ---
 if ! docker volume inspect "$VOLUME" &>/dev/null; then
