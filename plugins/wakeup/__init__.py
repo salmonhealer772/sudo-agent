@@ -71,37 +71,33 @@ def _read_today_log() -> tuple[str, str | None]:
 def _search_recent_sessions() -> tuple[str, str | None]:
     """Search recent sessions for context using Hermes' built-in session search.
 
-    Pulls the most recent 3 sessions as previews, plus searches for any
-    topics mentioned in MEMORY.md to find related past conversations.
+    Pulls the most recent 3 sessions as previews, plus uses the content
+    of the most recent session as a query to find related past conversations.
     """
     try:
         from tools.session_search_tool import session_search
 
-        # Browse: get recent sessions
+        # Browse: get recent sessions as previews
         recent = session_search(limit=3)
-
-        # If MEMORY.md has content, use it as a search query to find
-        # related past sessions
-        memory_path = _get_hermes_home() / "MEMORY.md"
-        query_results = ""
-        if memory_path.exists():
-            try:
-                memory_text = memory_path.read_text(encoding="utf-8").strip()
-                if memory_text:
-                    # Take first 200 chars of MEMORY.md as search query
-                    query = memory_text[:200]
-                    query_results = session_search(query=query, limit=2)
-            except Exception:
-                pass
 
         parts = []
         if recent and "no sessions found" not in recent.lower():
             parts.append(f"# RECENT SESSIONS\n\n{recent}")
-        if query_results and "no sessions found" not in query_results.lower():
-            parts.append(f"# RELATED PAST SESSIONS\n\n{query_results}")
+
+            # Use the first 200 chars of the most recent session as a search
+            # query to find related past conversations. This chains context
+            # from what was last discussed.
+            try:
+                # The browse result starts with the session title
+                query = recent[:200]
+                related = session_search(query=query, limit=2)
+                if related and "no sessions found" not in related.lower():
+                    parts.append(f"# RELATED PAST SESSIONS\n\n{related}")
+            except Exception:
+                pass
 
         if not parts:
-            return "", ""  # No sessions yet — fresh start
+            return "", ""
 
         return "\n\n".join(parts), None
     except ImportError:
