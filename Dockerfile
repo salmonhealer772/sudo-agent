@@ -11,6 +11,11 @@ RUN apt-get update && \
     echo "hermes ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/hermes && \
     chmod 0440 /etc/sudoers.d/hermes
 
+# Install agent-browser (headless Chrome) so the agent can browse the web out of the box
+RUN npm install -g agent-browser && \
+    agent-browser install --with-deps && \
+    rm -rf /root/.npm /root/.cache
+
 # Copy the memory review patcher and run it
 COPY patch_memory_review.py /tmp/patch_memory_review.py
 RUN python3 /tmp/patch_memory_review.py && rm /tmp/patch_memory_review.py
