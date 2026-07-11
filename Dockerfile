@@ -16,6 +16,9 @@ RUN npm install -g agent-browser && \
     agent-browser install --with-deps && \
     rm -rf /root/.npm /root/.cache
 
+# Copy the wakeup plugin for auto-context injection
+COPY plugins/wakeup /opt/hermes/plugins/wakeup/
+
 # Copy the memory review patcher and run it
 COPY patch_memory_review.py /tmp/patch_memory_review.py
 RUN python3 /tmp/patch_memory_review.py && rm /tmp/patch_memory_review.py
