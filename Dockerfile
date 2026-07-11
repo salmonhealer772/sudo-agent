@@ -11,17 +11,16 @@ RUN apt-get update && \
     echo "hermes ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/hermes && \
     chmod 0440 /etc/sudoers.d/hermes
 
-# Install agent-browser (headless Chrome) so the agent can browse the web out of the box.
-# Symlink Chrome into PATH so Hermes's _chromium_installed() gate check passes.
-RUN npm install -g agent-browser && \
-    agent-browser install --with-deps && \
-    CHROME=$(find /root/.agent-browser -name chrome -type f | head -1) && \
-    ln -sf "$CHROME" /usr/local/bin/google-chrome && \
-    rm -rf /root/.npm /root/.cache
+# Install DuckDuckGo search backend so web_search tool registers automatically
+RUN . /opt/hermes/.venv/bin/activate && uv pip install ddgs
 
 # Copy the memory review patcher and run it
 COPY patch_memory_review.py /tmp/patch_memory_review.py
 RUN python3 /tmp/patch_memory_review.py && rm /tmp/patch_memory_review.py
+
+# Pre-seed agent education: tell the agent how to discover its own tools
+RUN mkdir -p /opt/data/home/.hermes && \
+    echo "If you are unsure what tools you have available, run 'hermes tools' to list them." >> /opt/data/home/.hermes/AGENTS.md
 
 ENV SUDO_PASSWORD=""
 
