@@ -11,13 +11,13 @@ RUN apt-get update && \
     echo "hermes ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/hermes && \
     chmod 0440 /etc/sudoers.d/hermes
 
-# Install agent-browser (headless Chrome) so the agent can browse the web out of the box
+# Install agent-browser (headless Chrome) so the agent can browse the web out of the box.
+# Symlink Chrome into PATH so Hermes's _chromium_installed() gate check passes.
 RUN npm install -g agent-browser && \
     agent-browser install --with-deps && \
+    CHROME=$(find /root/.agent-browser -name chrome -type f | head -1) && \
+    ln -sf "$CHROME" /usr/local/bin/google-chrome && \
     rm -rf /root/.npm /root/.cache
-
-# Copy the wakeup plugin for auto-context injection
-COPY plugins/wakeup /opt/hermes/plugins/wakeup/
 
 # Copy the memory review patcher and run it
 COPY patch_memory_review.py /tmp/patch_memory_review.py
