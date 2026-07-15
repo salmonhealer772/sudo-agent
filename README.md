@@ -1,13 +1,13 @@
 # sudo-agent
 
-**One command. Hermes Agent with **privileged** root inside its container. Zero escape.**
+**One command. Hermes Agent with **privileged** root inside its container.**
 
 ## What It Does
 
 - **Auto memory** — everything you tell it gets stored. No commands, no prompts, no opt-in.
 - **Auto recall** — relevant context appears when you need it. Start a new session, it remembers.
 - **Full privileged sudo** — the agent has **full privileged access** inside its own container. Can `apt install`, `sudo` anything, **mount filesystems**, **load kernel modules**, **run Docker (socket mounted)**, access `/dev` devices, edit configs, do whatever it wants.
-- **Zero escape** — cannot reach the host. Even with `--privileged`, Docker is the boundary. Nothing leaves the container.
+- **Isolation boundary** — designed so the agent cannot reach the host. Docker is the cage. With `--privileged` that boundary is thinner, so don't run this on a production host with sensitive data.
 - **Multi-agent** — run alice, bob, charlie in parallel. Each gets its own container, brain, memory, and sudo password.
 - **CLI in the container** — git, docker-cli, openssh, python, node, ripgrep, ffmpeg, Playwright. Full terminal.
 
@@ -43,7 +43,7 @@ Bring it down → remembers everything. Bring it up → where you left off.
 | Boundary | Access |
 |---|---|
 | Inside container | **Full privileged root.** `sudo` anything, install packages, mount filesystems, load kernel modules, run Docker (socket mounted), modify configs, destroy itself. |
-| Outside (host) | **None.** Docker is the cage. Agent cannot touch the host. |
+| Outside (host) | **Designed to be none.** Docker is the primary cage, but `--privileged` + Docker socket weakens that boundary. Do not run on a host with sensitive data you can't afford to lose. |
 | Between containers | **None.** alice can't see bob's volume or processes. |
 
 The sudo password is random 16-char alphanumeric, generated on first `up.sh`, saved to `~/.sudo-agent/.env`. The agent knows it via `SUDO_PASSWORD` env var (native Hermes support).
@@ -65,7 +65,6 @@ The sudo password is random 16-char alphanumeric, generated on first `up.sh`, sa
 
 - Run local LLMs — DeepSeek API only
 - Multi-agent orchestration between containers — single agent per container
-- Escape its container — that's the point
 
 ## Stack
 
