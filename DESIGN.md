@@ -2,14 +2,14 @@
 
 ## What It Is
 
-One command. Hermes Agent on DeepSeek — contained in Docker. Multiple agents by name, each isolated in its own container with full root access and zero host escape.
+One command. Hermes Agent on DeepSeek — contained in Docker. Multiple agents by name, each isolated in its own container with full privileged root access and zero host escape.
 
 ## Scripts (`scripts/`)
 
 | Script | What | Notes |
 |---|---|---|
 | `setup.sh` | One-time: builds Docker image, prompts for DeepSeek API key | Run once per machine |
-| `scripts/up.sh --name` | Create or restart `sudo-{name}` container | Generates sudo password on first run |
+| `scripts/up.sh --name` | Create or restart `sudo-{name}` container (privileged) | Generates sudo password on first run |
 | `scripts/talk.sh --name` | `docker exec -it sudo-{name} hermes` | Talks to the agent |
 | `scripts/ssh.sh --name` | `docker exec -it sudo-{name} bash` | Root shell |
 | `scripts/down.sh --name` | Stop `sudo-{name}`, volume persists | Memory survives |
@@ -29,6 +29,8 @@ One command. Hermes Agent on DeepSeek — contained in Docker. Multiple agents b
 
 ## Inside Each Container
 
+- **Privileged mode** — all capabilities, all devices, seccomp+apparmor disabled
+- Docker socket mounted at `/var/run/docker.sock` — can run Docker commands
 - Hermes Agent gateway running (background)
 - DeepSeek via custom OpenAI-compatible endpoint (`api.deepseek.com/v1`)
 - Auto memory (MEMORY.md 100k chars + USER.md 50k chars tokens injected at session start)
@@ -36,6 +38,15 @@ One command. Hermes Agent on DeepSeek — contained in Docker. Multiple agents b
 - Session search (FTS5) for older conversations
 - `SUDO_PASSWORD` env var set — agent can `sudo` anything
 - **Cannot reach the host** — Docker security boundary
+
+## What --privileged Enables
+
+- `mount` / `umount` — FUSE, tmpfs, bind mounts
+- `modprobe` — load kernel modules
+- Access all `/dev/*` devices
+- `dmesg`, `perf`, `ptrace` — system introspection
+- Network manipulation (interfaces, iptables)
+- Docker socket passed through for container management
 
 ## How Auto Memory Works
 
