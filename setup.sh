@@ -32,12 +32,12 @@ docker build -t sudo-agent:latest -f "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR" || {
 echo "✓ sudo-agent image built"
 
 # --- Prompt for DeepSeek API key ---
-ENV_FILE="$HOME/.sudo-agent/.env"
-CONFIG_FILE="$HOME/.sudo-agent/config.yaml"
-mkdir -p "$HOME/.sudo-agent"
+ENV_FILE="$SCRIPT_DIR/.env"
+CONFIG_FILE="$SCRIPT_DIR/config.yaml"
 
-if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null || \
-     grep -q '^DEEPSEEK_API_KEY=\s*$' "$ENV_FILE" 2>/dev/null; then
+# Always create/overwrite .env with a fresh API key prompt
+# (Previous key may be stale, so we always prompt)
+if true; then
   echo ""
   echo "┌─────────────────────────────────────────────┐"
   echo "│  DeepSeek API Key Required                   │"
@@ -53,9 +53,10 @@ if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null || \
     exit 1
   fi
 
-  echo "" >> "$ENV_FILE"
-  echo "# DeepSeek (set by sudo-agent/setup.sh)" >> "$ENV_FILE"
-  echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY" >> "$ENV_FILE"
+  cat > "$ENV_FILE" << DOTENVEOF
+# sudo-agent config (set by setup.sh)
+DEEPSEEK_API_KEY=$DEEPSEEK_KEY
+DOTENVEOF
 fi
 
 # --- Ensure config.yaml ---
@@ -63,8 +64,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   cat > "$CONFIG_FILE" << 'CONFIGEOF'
 model:
   default: "deepseek-chat"
-  provider: "custom"
-  base_url: "https://api.deepseek.com/v1"
+  provider: "deepseek"
 terminal:
   backend: "local"
   sudo_password_env: "SUDO_PASSWORD"
@@ -78,9 +78,10 @@ memory:
 CONFIGEOF
 else
   sed -i 's|^  default:.*|  default: "deepseek-chat"|' "$CONFIG_FILE"
-  sed -i 's|^  provider:.*|  provider: "custom"|' "$CONFIG_FILE"
-  sed -i 's|^  base_url:.*|  base_url: "https://api.deepseek.com/v1"|' "$CONFIG_FILE"
+  sed -i 's|^  provider:.*|  provider: "deepseek"|' "$CONFIG_FILE"
   sed -i 's|^  backend:.*|  backend: "local"|' "$CONFIG_FILE"
+  # Remove any stale base_url line
+  sed -i '/^  base_url:/d' "$CONFIG_FILE"
 fi
 
 echo ""

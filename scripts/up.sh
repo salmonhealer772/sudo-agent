@@ -32,8 +32,8 @@ fi
 
 CONTAINER="sudo-$NAME"
 VOLUME="sudo-$NAME-data"
-ENV_FILE="$HOME/.sudo-agent/.env"
-CONFIG_FILE="$HOME/.sudo-agent/config.yaml"
+ENV_FILE="$(cd "$SCRIPT_DIR" && cd .. && pwd)/.env"
+CONFIG_FILE="$(cd "$SCRIPT_DIR" && cd .. && pwd)/config.yaml"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 mkdir -p "$HOME/.sudo-agent"
@@ -61,16 +61,15 @@ if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null || \
     exit 1
   fi
 
-  echo "" >> "$ENV_FILE"
-  echo "# DeepSeek (set by sudo-agent/up.sh)" >> "$ENV_FILE"
-  echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY" >> "$ENV_FILE"
+  cat > "$ENV_FILE" << DOTENVEOF
+# sudo-agent config (set by up.sh)
+DEEPSEEK_API_KEY=$DEEPSEEK_KEY
+DOTENVEOF
 
-  if [[ ! -f "$CONFIG_FILE" ]]; then
-    cat > "$CONFIG_FILE" << 'EOF'
+  cat > "$CONFIG_FILE" << 'EOF'
 model:
   default: "deepseek-chat"
-  provider: "custom"
-  base_url: "https://api.deepseek.com/v1"
+  provider: "deepseek"
 terminal:
   backend: "local"
   sudo_password_env: "SUDO_PASSWORD"
@@ -84,22 +83,10 @@ memory:
 EOF
   else
     sed -i 's|^  default:.*|  default: "deepseek-chat"|' "$CONFIG_FILE"
-    sed -i 's|^  provider:.*|  provider: "custom"|' "$CONFIG_FILE"
-    sed -i 's|^  base_url:.*|  base_url: "https://api.deepseek.com/v1"|' "$CONFIG_FILE"
+    sed -i 's|^  provider:.*|  provider: "deepseek"|' "$CONFIG_FILE"
     sed -i 's|^  backend:.*|  backend: "local"|' "$CONFIG_FILE"
-    cat >> "$CONFIG_FILE" << 'EOF'
-
-memory:
-  memory_char_limit: 100000
-  user_char_limit: 50000
-  memory_enabled: true
-  user_profile_enabled: true
-  write_approval: false
-  nudge_interval: 1
-
-terminal:
-  sudo_password_env: "SUDO_PASSWORD"
-EOF
+    # Remove stale base_url line if present
+    sed -i '/^  base_url:/d' "$CONFIG_FILE"
   fi
 
   echo "✓ API key saved. Model set to deepseek-chat."
