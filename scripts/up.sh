@@ -66,7 +66,8 @@ if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null || \
 DEEPSEEK_API_KEY=$DEEPSEEK_KEY
 DOTENVEOF
 
-  cat > "$CONFIG_FILE" << 'EOF'
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    cat > "$CONFIG_FILE" << 'EOF'
 model:
   default: "deepseek-chat"
   provider: "deepseek"
