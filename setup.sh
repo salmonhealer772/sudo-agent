@@ -53,17 +53,17 @@ if true; then
     exit 1
   fi
 
-  cat > "$ENV_FILE" << DOTENVEOF
-# sudo-agent config (set by setup.sh)
-DEEPSEEK_API_KEY=$DEEPSEEK_KEY
-DOTENVEOF
+  # Write .env using echo (avoids heredoc issues)
+  echo "# sudo-agent config (set by setup.sh)" > "$ENV_FILE"
+  echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY" >> "$ENV_FILE"
+  echo "✓ API key saved to $ENV_FILE"
 fi
 
 # --- Ensure config.yaml ---
 if [[ ! -f "$CONFIG_FILE" ]]; then
   cat > "$CONFIG_FILE" << 'CONFIGEOF'
 model:
-  default: "deepseek-chat"
+  default: "deepseek-v4-pro"
   provider: "deepseek"
 terminal:
   backend: "local"
@@ -77,7 +77,7 @@ memory:
   nudge_interval: 1
 CONFIGEOF
 else
-  sed -i 's|^  default:.*|  default: "deepseek-chat"|' "$CONFIG_FILE"
+  sed -i 's|^  default:.*|  default: "deepseek-v4-pro"|' "$CONFIG_FILE"
   sed -i 's|^  provider:.*|  provider: "deepseek"|' "$CONFIG_FILE"
   sed -i 's|^  backend:.*|  backend: "local"|' "$CONFIG_FILE"
   # Remove any stale base_url line

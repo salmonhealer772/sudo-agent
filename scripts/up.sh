@@ -69,7 +69,7 @@ DOTENVEOF
   if [[ ! -f "$CONFIG_FILE" ]]; then
     cat > "$CONFIG_FILE" << 'EOF'
 model:
-  default: "deepseek-chat"
+  default: "deepseek-v4-pro"
   provider: "deepseek"
 terminal:
   backend: "local"
@@ -83,14 +83,14 @@ memory:
   nudge_interval: 1
 EOF
   else
-    sed -i 's|^  default:.*|  default: "deepseek-chat"|' "$CONFIG_FILE"
+    sed -i 's|^  default:.*|  default: "deepseek-v4-pro"|' "$CONFIG_FILE"
     sed -i 's|^  provider:.*|  provider: "deepseek"|' "$CONFIG_FILE"
     sed -i 's|^  backend:.*|  backend: "local"|' "$CONFIG_FILE"
     # Remove stale base_url line if present
     sed -i '/^  base_url:/d' "$CONFIG_FILE"
   fi
 
-  echo "✓ API key saved. Model set to deepseek-chat."
+  echo "✓ API key saved. Model set to deepseek-v4-pro."
   echo ""
 fi
 
