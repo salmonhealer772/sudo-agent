@@ -32,11 +32,11 @@ fi
 
 CONTAINER="sudo-$NAME"
 VOLUME="sudo-$NAME-data"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$(cd "$SCRIPT_DIR" && cd .. && pwd)/.env"
 CONFIG_FILE="$(cd "$SCRIPT_DIR" && cd .. && pwd)/config.yaml"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-mkdir -p "$HOME/.sudo-agent"
+# (Using repo root .env and config.yaml)
 
 # Guard: if config.yaml is somehow a directory (Docker bind-mount bug), remove it
 if [[ -d "$CONFIG_FILE" ]]; then
