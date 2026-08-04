@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 # kube-scripts/up.sh — Deploy a sudo-agent to Kubernetes
 # Usage: bash kube-scripts/up.sh --name
@@ -31,6 +31,8 @@ ENV_FILE="$REPO_DIR/.env"
 DEPLOY="sudo-$NAME"
 YAML="$SCRIPT_DIR/$NAME.yaml"
 
+echo "→ sudo-$NAME starting up..."
+
 # ── API Key ──
 KEY="${DEEPSEEK_API_KEY:-}"
 if [[ -z "$KEY" ]] && [[ -f "$ENV_FILE" ]] && [[ -r "$ENV_FILE" ]]; then
@@ -50,14 +52,19 @@ fi
 if [[ -z "$SUDO_PASS" ]]; then
   SUDO_PASS=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 16)
   echo "SUDO_PASSWORD=$SUDO_PASS" >> "$ENV_FILE" 2>/dev/null || true
+  echo "→ Generated sudo password: $SUDO_PASS"
 fi
 
 # ── Generate YAML ──
+echo "→ Writing $YAML..."
 cat > "$YAML" <<YAMLEOF
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: $DEPLOY-data
+  labels:
+    app: sudo-agent
+    agent: $NAME
 spec:
   accessModes:
     - ReadWriteOnce
@@ -121,13 +128,26 @@ spec:
           type: Socket
 YAMLEOF
 
-# ── Import images into containerd ──
-docker save hermes-agent:latest 2>/dev/null | sudo k3s ctr image import - 2>/dev/null || true
-docker save sudo-agent:latest | sudo k3s ctr image import - 2>/dev/null || {
-  docker save sudo-agent:latest | sudo ctr -n k8s.io image import -
+echo "→ YAML written"
+
+# ── Import images into containerd (best-effort, don't die) ──
+_import_image() {
+  local img="$1"
+  if docker save "$img" 2>/dev/null | sudo k3s ctr image import - 2>/dev/null; then
+    echo "→ $img imported via k3s ctr"
+  elif docker save "$img" 2>/dev/null | sudo ctr -n k8s.io image import - 2>/dev/null; then
+    echo "→ $img imported via ctr"
+  else
+    echo "⚠ Could not import $img — it might already be present"
+  fi
 }
 
+echo "→ Importing images..."
+_import_image hermes-agent:latest
+_import_image sudo-agent:latest
+
 # ── Apply ──
+echo "→ Deploying..."
 kubectl apply -f "$YAML"
 
 echo ""
