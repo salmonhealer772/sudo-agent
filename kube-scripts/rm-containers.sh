@@ -6,6 +6,13 @@ set -euo pipefail
 #   bash kube-scripts/rm-containers.sh --name     Remove one
 #   bash kube-scripts/rm-containers.sh --ALL       Nuke ALL sudo-*
 
+# Auto-detect kubeconfig
+if [[ -z "${KUBECONFIG:-}" ]]; then
+  for cfg in "/etc/rancher/k3s/k3s.yaml" "/home/world15/.kube/config" "$HOME/.kube/config"; do
+    if [[ -f "$cfg" ]]; then export KUBECONFIG="$cfg"; break; fi
+  done
+fi
+
 NAME=""
 REMOVE_ALL=false
 

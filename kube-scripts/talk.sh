@@ -20,4 +20,11 @@ if [[ "${NAME,,}" == "all" ]]; then
   echo "Use rm-containers.sh --ALL instead." >&2; exit 1
 fi
 
+# Auto-detect kubeconfig
+if [[ -z "${KUBECONFIG:-}" ]]; then
+  for cfg in "/etc/rancher/k3s/k3s.yaml" "/home/world15/.kube/config" "$HOME/.kube/config"; do
+    if [[ -f "$cfg" ]]; then export KUBECONFIG="$cfg"; break; fi
+  done
+fi
+
 kubectl exec -it "deploy/sudo-$NAME" -- hermes
