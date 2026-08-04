@@ -161,7 +161,7 @@ spec:
           type: Socket
 YAMLEOF
 
-echo "→ YAML written"
+echo "→ YAML written: $YAML"
 
 # ── Import images into containerd (best-effort, don't die) ──
 _import_image() {
