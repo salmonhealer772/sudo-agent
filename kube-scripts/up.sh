@@ -128,7 +128,7 @@ spec:
       - name: sudo-agent
         image: sudo-agent:latest
         imagePullPolicy: IfNotPresent
-        command: ["gateway", "run"]
+        args: ["gateway", "run"]
         securityContext:
           privileged: true
         env:
