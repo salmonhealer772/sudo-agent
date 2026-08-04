@@ -34,12 +34,16 @@ YAML="$SCRIPT_DIR/$NAME.yaml"
 
 # Auto-detect kubeconfig (sudo changes HOME, kubectl can lose it)
 if [[ -z "${KUBECONFIG:-}" ]]; then
-  for cfg in "/etc/rancher/k3s/k3s.yaml" "$HOME/.kube/config"; do
+  for cfg in "/etc/rancher/k3s/k3s.yaml" "/home/world15/.kube/config" "$HOME/.kube/config"; do
     if [[ -f "$cfg" ]]; then
       export KUBECONFIG="$cfg"
       break
     fi
   done
+  if [[ -z "${KUBECONFIG:-}" ]]; then
+    echo "No kubeconfig found. Is k3s running? Try: export KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >&2
+    exit 1
+  fi
 fi
 
 # Ensure .sudo-agent exists and is writable
@@ -168,7 +172,10 @@ _import_image sudo-agent:latest
 
 # ── Apply ──
 echo "→ Deploying..."
-kubectl apply -f "$YAML"
+if ! kubectl apply -f "$YAML" --validate=false; then
+  echo "✗ kubectl apply failed. Check: kubectl cluster-info" >&2
+  exit 1
+fi
 
 echo ""
 echo "✓ $DEPLOY deployed"
