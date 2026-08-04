@@ -32,6 +32,16 @@ ENV_FILE="$ENV_DIR/.env"
 DEPLOY="sudo-$NAME"
 YAML="$SCRIPT_DIR/$NAME.yaml"
 
+# Auto-detect kubeconfig (sudo changes HOME, kubectl can lose it)
+if [[ -z "${KUBECONFIG:-}" ]]; then
+  for cfg in "/etc/rancher/k3s/k3s.yaml" "$HOME/.kube/config"; do
+    if [[ -f "$cfg" ]]; then
+      export KUBECONFIG="$cfg"
+      break
+    fi
+  done
+fi
+
 # Ensure .sudo-agent exists and is writable
 mkdir -p "$ENV_DIR" 2>/dev/null || {
   echo "Cannot create $ENV_DIR — run with sudo or chown the repo." >&2; exit 1
