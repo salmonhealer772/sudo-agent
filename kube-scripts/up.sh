@@ -27,7 +27,10 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-ENV_FILE="$REPO_DIR/.env"
+# Use home dir for secrets — survives root-owned repos and repo wipes
+USER_ENV="$HOME/.sudo-agent"
+USER_ENV_FILE="$USER_ENV/.env"
+REPO_ENV_FILE="$REPO_DIR/.env"
 DEPLOY="sudo-$NAME"
 YAML="$SCRIPT_DIR/$NAME.yaml"
 
@@ -35,15 +38,18 @@ echo "→ sudo-$NAME starting up..."
 
 # ── API Key ──
 KEY="${DEEPSEEK_API_KEY:-}"
-if [[ -z "$KEY" ]] && [[ -f "$ENV_FILE" ]] && [[ -r "$ENV_FILE" ]]; then
-  KEY=$(grep '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2- || true)
-fi
+# Check user env first, then repo env
+for f in "$USER_ENV_FILE" "$REPO_ENV_FILE"; do
+  [[ -z "$KEY" ]] && [[ -f "$f" ]] && [[ -r "$f" ]] && \
+    KEY=$(grep '^DEEPSEEK_API_KEY=' "$f" 2>/dev/null | cut -d'=' -f2- || true)
+done
 if [[ -z "$KEY" ]]; then
   read -r -p "DeepSeek API key: " KEY
-  # Save it so we never ask again
+  # Save to user-writable location so we never ask again
   if [[ -n "$KEY" ]]; then
-    if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null; then
-      echo "DEEPSEEK_API_KEY=$KEY" >> "$ENV_FILE" || true
+    mkdir -p "$USER_ENV"
+    if ! grep -q '^DEEPSEEK_API_KEY=' "$USER_ENV_FILE" 2>/dev/null; then
+      echo "DEEPSEEK_API_KEY=$KEY" >> "$USER_ENV_FILE"
     fi
   fi
 fi
@@ -52,12 +58,13 @@ if [[ -z "$KEY" ]]; then
 fi
 
 # ── Sudo password ──
-if [[ -f "$ENV_FILE" ]] && [[ -r "$ENV_FILE" ]]; then
-  SUDO_PASS=$(grep '^SUDO_PASSWORD=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2- || true)
-fi
+for f in "$USER_ENV_FILE" "$REPO_ENV_FILE"; do
+  [[ -z "$SUDO_PASS" ]] && [[ -f "$f" ]] && [[ -r "$f" ]] && \
+    SUDO_PASS=$(grep '^SUDO_PASSWORD=' "$f" 2>/dev/null | cut -d'=' -f2- || true)
+done
 if [[ -z "$SUDO_PASS" ]]; then
   SUDO_PASS=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 16)
-  echo "SUDO_PASSWORD=$SUDO_PASS" >> "$ENV_FILE" 2>/dev/null || true
+  echo "SUDO_PASSWORD=$SUDO_PASS" >> "$USER_ENV_FILE" 2>/dev/null || true
   echo "→ Generated sudo password: $SUDO_PASS"
 fi
 
