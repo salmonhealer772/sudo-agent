@@ -117,7 +117,6 @@ spec:
           mountPath: /opt/data
         - name: config
           mountPath: /opt/data/config.yaml
-          subPath: config.yaml
         - name: docker-sock
           mountPath: /var/run/docker.sock
       volumes:
@@ -127,7 +126,7 @@ spec:
       - name: config
         hostPath:
           path: $REPO_DIR/config.yaml
-          type: FileOrCreate
+          type: File
       - name: docker-sock
         hostPath:
           path: /var/run/docker.sock
