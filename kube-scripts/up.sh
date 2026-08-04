@@ -54,13 +54,22 @@ mkdir -p "$ENV_DIR" 2>/dev/null || {
 echo "→ sudo-$NAME starting up..."
 
 # ── API Key ──
+# Check .env (setup.sh) first, then .sudo-agent/.env (kube-scripts)
+_read_key() {
+  local f="$1"
+  grep '^DEEPSEEK_API_KEY=' "$f" 2>/dev/null | cut -d'=' -f2- | head -1
+}
+
 KEY="${DEEPSEEK_API_KEY:-}"
-if [[ -z "$KEY" ]] && [[ -f "$ENV_FILE" ]] && [[ -r "$ENV_FILE" ]]; then
-  KEY=$(grep '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2- || true)
-fi
+for f in "$REPO_DIR/.env" "$ENV_FILE"; do
+  if [[ -z "$KEY" ]] && [[ -f "$f" ]] && [[ -r "$f" ]]; then
+    KEY=$(_read_key "$f")
+  fi
+done
 if [[ -z "$KEY" ]]; then
   read -r -p "DeepSeek API key: " KEY
   if [[ -n "$KEY" ]]; then
+    mkdir -p "$ENV_DIR"
     if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null; then
       echo "DEEPSEEK_API_KEY=$KEY" >> "$ENV_FILE"
     fi
