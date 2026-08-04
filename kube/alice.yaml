@@ -1,0 +1,67 @@
+# kubectl apply -f alice.yaml
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sudo-alice-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sudo-alice
+  labels:
+    app: sudo-agent
+    agent: alice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sudo-agent
+      agent: alice
+  template:
+    metadata:
+      labels:
+        app: sudo-agent
+        agent: alice
+    spec:
+      hostNetwork: true
+      containers:
+      - name: sudo-agent
+        image: sudo-agent:latest
+        imagePullPolicy: IfNotPresent
+        command: ["gateway", "run"]
+        securityContext:
+          privileged: true
+        env:
+        - name: DEEPSEEK_API_KEY
+          value: "YOUR_DEEPSEEK_API_KEY_HERE"
+        - name: SUDO_PASSWORD
+          value: "CHANGEME"
+        - name: HERMES_YOLO_MODE
+          value: "true"
+        volumeMounts:
+        - name: data
+          mountPath: /opt/data
+        - name: config
+          mountPath: /opt/data/config.yaml
+          subPath: config.yaml
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: sudo-alice-data
+      - name: config
+        hostPath:
+          path: /path/to/sudo-agent/config.yaml
+          type: File
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+          type: Socket
