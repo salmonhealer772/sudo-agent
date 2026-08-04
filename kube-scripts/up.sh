@@ -40,6 +40,12 @@ if [[ -z "$KEY" ]] && [[ -f "$ENV_FILE" ]] && [[ -r "$ENV_FILE" ]]; then
 fi
 if [[ -z "$KEY" ]]; then
   read -r -p "DeepSeek API key: " KEY
+  # Save it so we never ask again
+  if [[ -n "$KEY" ]]; then
+    if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null; then
+      echo "DEEPSEEK_API_KEY=$KEY" >> "$ENV_FILE" || true
+    fi
+  fi
 fi
 if [[ -z "$KEY" ]]; then
   echo "No API key provided." >&2; exit 1
