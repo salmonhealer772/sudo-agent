@@ -53,9 +53,17 @@ if true; then
     exit 1
   fi
 
-  # Write .env using echo (avoids heredoc issues)
-  echo "# sudo-agent config (set by setup.sh)" > "$ENV_FILE"
-  echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY" >> "$ENV_FILE"
+  # Write .env — use sudo if dir is root-owned, otherwise direct
+  if ! echo "" >> "$ENV_FILE" 2>/dev/null; then
+    echo "→ Repo is root-owned. Using sudo to save credentials..."
+    { echo "# sudo-agent config (set by setup.sh)"; echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY"; } | sudo tee "$ENV_FILE" > /dev/null 2>&1 || {
+      echo "✗ Could not write .env. Run: sudo chown -R \$USER:\$USER $SCRIPT_DIR" >&2
+      exit 1
+    }
+  else
+    echo "# sudo-agent config (set by setup.sh)" > "$ENV_FILE"
+    echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY" >> "$ENV_FILE"
+  fi
   echo "✓ API key saved to $ENV_FILE"
 fi
 

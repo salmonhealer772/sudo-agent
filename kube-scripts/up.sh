@@ -27,8 +27,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-ENV_DIR="$REPO_DIR/.sudo-agent"
-ENV_FILE="$ENV_DIR/.env"
+ENV_FILE="$REPO_DIR/.env"
 DEPLOY="sudo-$NAME"
 YAML="$SCRIPT_DIR/$NAME.yaml"
 
@@ -46,32 +45,22 @@ if [[ -z "${KUBECONFIG:-}" ]]; then
   fi
 fi
 
-# Ensure .sudo-agent exists and is writable
-mkdir -p "$ENV_DIR" 2>/dev/null || {
-  echo "Cannot create $ENV_DIR — run with sudo or chown the repo." >&2; exit 1
-}
-
 echo "→ sudo-$NAME starting up..."
 
 # ── API Key ──
-# Check .env (setup.sh) first, then .sudo-agent/.env (kube-scripts)
 _read_key() {
-  local f="$1"
-  grep '^DEEPSEEK_API_KEY=' "$f" 2>/dev/null | cut -d'=' -f2- | head -1
+  grep '^DEEPSEEK_API_KEY=' "$1" 2>/dev/null | cut -d'=' -f2- | head -1
 }
 
 KEY="${DEEPSEEK_API_KEY:-}"
-for f in "$REPO_DIR/.env" "$ENV_FILE"; do
-  if [[ -z "$KEY" ]] && [[ -f "$f" ]] && [[ -r "$f" ]]; then
-    KEY=$(_read_key "$f")
-  fi
-done
+if [[ -z "$KEY" ]] && [[ -f "$ENV_FILE" ]] && [[ -r "$ENV_FILE" ]]; then
+  KEY=$(_read_key "$ENV_FILE")
+fi
 if [[ -z "$KEY" ]]; then
   read -r -p "DeepSeek API key: " KEY
   if [[ -n "$KEY" ]]; then
-    mkdir -p "$ENV_DIR"
     if ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null; then
-      echo "DEEPSEEK_API_KEY=$KEY" >> "$ENV_FILE"
+      echo "DEEPSEEK_API_KEY=$KEY" >> "$ENV_FILE" || echo "⚠ Could not save key to $ENV_FILE — use sudo or chown" >&2
     fi
   fi
 fi
