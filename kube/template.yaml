@@ -1,9 +1,10 @@
-# kubectl apply -f alice.yaml
+# Copy and edit, or use: bash kube/init.sh --name <yourname>
+# Placeholders: __NAME__  __KEY__  __SUDO_PASS__  __REPO_DIR__
 
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: sudo-alice-data
+  name: sudo-__NAME__-data
 spec:
   accessModes:
     - ReadWriteOnce
@@ -14,21 +15,21 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: sudo-alice
+  name: sudo-__NAME__
   labels:
     app: sudo-agent
-    agent: alice
+    agent: __NAME__
 spec:
   replicas: 1
   selector:
     matchLabels:
       app: sudo-agent
-      agent: alice
+      agent: __NAME__
   template:
     metadata:
       labels:
         app: sudo-agent
-        agent: alice
+        agent: __NAME__
     spec:
       hostNetwork: true
       containers:
@@ -40,9 +41,9 @@ spec:
           privileged: true
         env:
         - name: DEEPSEEK_API_KEY
-          value: "YOUR_DEEPSEEK_API_KEY_HERE"
+          value: "__KEY__"
         - name: SUDO_PASSWORD
-          value: "CHANGEME"
+          value: "__SUDO_PASS__"
         - name: HERMES_YOLO_MODE
           value: "true"
         volumeMounts:
@@ -56,10 +57,10 @@ spec:
       volumes:
       - name: data
         persistentVolumeClaim:
-          claimName: sudo-alice-data
+          claimName: sudo-__NAME__-data
       - name: config
         hostPath:
-          path: /path/to/sudo-agent/config.yaml
+          path: __REPO_DIR__/config.yaml
           type: File
       - name: docker-sock
         hostPath:
