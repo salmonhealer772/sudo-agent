@@ -28,15 +28,18 @@ if $REMOVE_ALL; then
   echo "→ Nuking ALL sudo-* from Kubernetes..."
   kubectl delete deploy -l app=sudo-agent 2>/dev/null || true
   kubectl delete pvc -l app=sudo-agent 2>/dev/null || true
-  rm -f "$(dirname "$0")"/*.yaml 2>/dev/null || true
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+  rm -f "$REPO_DIR/deployments"/*.yaml 2>/dev/null || true
   echo "✓ Gone."
 elif [[ -n "$NAME" ]]; then
   DEPLOY="sudo-$NAME"
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
   if kubectl get deploy "$DEPLOY" &>/dev/null; then
     kubectl delete deploy "$DEPLOY"
     kubectl delete pvc "$DEPLOY-data" 2>/dev/null || true
-    rm -f "$SCRIPT_DIR/$NAME.yaml" 2>/dev/null || true
+    rm -f "$REPO_DIR/deployments/$NAME.yaml" 2>/dev/null || true
     echo "✓ $DEPLOY removed (deployment + volume)."
   else
     echo "→ $DEPLOY not found."

@@ -28,8 +28,17 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="$REPO_DIR/.env"
+YAML_DIR="$REPO_DIR/deployments"
 DEPLOY="sudo-$NAME"
-YAML="$SCRIPT_DIR/$NAME.yaml"
+YAML="$YAML_DIR/$NAME.yaml"
+
+# If repo is root-owned and we're not root, bail early
+if [[ ! -w "$REPO_DIR" ]] && [[ "$(id -u)" != "0" ]]; then
+  echo "Repo is root-owned. Run with: sudo bash kube-scripts/up.sh --$NAME" >&2
+  exit 1
+fi
+
+mkdir -p "$YAML_DIR" 2>/dev/null || true
 
 # Auto-detect kubeconfig (sudo changes HOME, kubectl can lose it)
 if [[ -z "${KUBECONFIG:-}" ]]; then
@@ -150,6 +159,9 @@ spec:
           type: Socket
 YAMLEOF
 
+if [[ ! -s "$YAML" ]]; then
+  echo "✗ Failed to write $YAML" >&2; exit 1
+fi
 echo "→ YAML written: $YAML"
 
 # ── Import images into containerd (best-effort, don't die) ──
