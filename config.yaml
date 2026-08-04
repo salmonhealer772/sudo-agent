@@ -1,0 +1,13 @@
+model:
+  default: "deepseek-v4-pro"
+  provider: "deepseek"
+terminal:
+  backend: "local"
+  sudo_password_env: "SUDO_PASSWORD"
+memory:
+  memory_char_limit: 100000
+  user_char_limit: 50000
+  memory_enabled: true
+  user_profile_enabled: true
+  write_approval: false
+  nudge_interval: 1
