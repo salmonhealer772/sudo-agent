@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # kube/init.sh — Spin up a sudo-agent in Kubernetes
-# Usage: bash kube/init.sh --name [--key KEY] [--sudo-pass PASS]
+# Usage: bash kube/init.sh --name <name> [--key KEY] [--sudo-pass PASS]
 
 NAME=""
 KEY=""
@@ -27,22 +27,29 @@ if [[ -z "$NAME" ]]; then
   exit 1
 fi
 
-# Get API key from env or .env
+# Find DeepSeek key — check env var, then .env, then ask
 if [[ -z "$KEY" ]]; then
-  KEY=$(grep '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || true)
+  KEY="${DEEPSEEK_API_KEY:-}"
+fi
+if [[ -z "$KEY" ]] && [[ -f "$ENV_FILE" ]] && [[ -r "$ENV_FILE" ]]; then
+  KEY=$(grep '^DEEPSEEK_API_KEY=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2- || true)
 fi
 if [[ -z "$KEY" ]]; then
-  echo "No DeepSeek API key found. Pass --key or set DEEPSEEK_API_KEY in .env" >&2
-  exit 1
+  read -r -p "DeepSeek API key: " KEY
+fi
+if [[ -z "$KEY" ]]; then
+  echo "No API key provided." >&2; exit 1
 fi
 
-# Get sudo password from env or generate
+# Find sudo password
 if [[ -z "$SUDO_PASS" ]]; then
-  SUDO_PASS=$(grep '^SUDO_PASSWORD=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2 || true)
+  if [[ -f "$ENV_FILE" ]] && [[ -r "$ENV_FILE" ]]; then
+    SUDO_PASS=$(grep '^SUDO_PASSWORD=' "$ENV_FILE" 2>/dev/null | cut -d'=' -f2- || true)
+  fi
 fi
 if [[ -z "$SUDO_PASS" ]]; then
   SUDO_PASS=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 16)
-  echo "SUDO_PASSWORD=$SUDO_PASS" >> "$ENV_FILE"
+  echo "SUDO_PASSWORD=$SUDO_PASS" >> "$ENV_FILE" 2>/dev/null || true
   echo "→ Generated sudo password: $SUDO_PASS"
 fi
 
