@@ -33,14 +33,24 @@ fi
 CONTAINER="sudo-$NAME"
 VOLUME="sudo-$NAME-data"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ENV_FILE="$(cd "$SCRIPT_DIR" && cd .. && pwd)/.env"
-CONFIG_FILE="$(cd "$SCRIPT_DIR" && cd .. && pwd)/config.yaml"
+REPO_DIR="$(cd "$SCRIPT_DIR" && cd .. && pwd)"
+ENV_FILE="$REPO_DIR/.env"
+CONFIG_DIR="$REPO_DIR/config"
+CONFIG_FILE="$CONFIG_DIR/$NAME.yaml"
+TEMPLATE_CONFIG="$REPO_DIR/config.yaml"
 
-# (Using repo root .env and config.yaml)
+# Per-agent config: seed config/<name>.yaml from the tracked template on first
+# run, then leave it alone so each agent's config can diverge (config isolation).
+mkdir -p "$CONFIG_DIR"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  cp "$TEMPLATE_CONFIG" "$CONFIG_FILE"
+fi
 
-# Guard: if config.yaml is somehow a directory (Docker bind-mount bug), remove it
+# Guard: if the per-agent config is somehow a directory (Docker bind-mount bug),
+# remove it and re-seed from the template
 if [[ -d "$CONFIG_FILE" ]]; then
   rm -rf "$CONFIG_FILE"
+  cp "$TEMPLATE_CONFIG" "$CONFIG_FILE"
 fi
 
 # --- 0. Prompt for DeepSeek API key if not set ---

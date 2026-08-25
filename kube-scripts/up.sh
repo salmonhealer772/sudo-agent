@@ -29,8 +29,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="$REPO_DIR/.env"
 YAML_DIR="$REPO_DIR/deployments"
+CONFIG_DIR="$REPO_DIR/config"
 DEPLOY="sudo-$NAME"
 YAML="$YAML_DIR/$NAME.yaml"
+PER_AGENT_CONFIG="$CONFIG_DIR/$NAME.yaml"
 
 # If repo is root-owned and we're not root, bail early
 if [[ ! -w "$REPO_DIR" ]] && [[ "$(id -u)" != "0" ]]; then
@@ -38,7 +40,13 @@ if [[ ! -w "$REPO_DIR" ]] && [[ "$(id -u)" != "0" ]]; then
   exit 1
 fi
 
-mkdir -p "$YAML_DIR" 2>/dev/null || true
+mkdir -p "$YAML_DIR" "$CONFIG_DIR" 2>/dev/null || true
+
+# Per-agent config: seed config/<name>.yaml from the tracked template on first
+# deploy, then leave it alone so each agent's config can diverge (config isolation).
+if [[ ! -f "$PER_AGENT_CONFIG" ]]; then
+  cp "$REPO_DIR/config.yaml" "$PER_AGENT_CONFIG"
+fi
 
 # Auto-detect kubeconfig (sudo changes HOME, kubectl can lose it)
 if [[ -z "${KUBECONFIG:-}" ]]; then
@@ -151,7 +159,7 @@ spec:
           claimName: $DEPLOY-data
       - name: config
         hostPath:
-          path: $REPO_DIR/config.yaml
+          path: $PER_AGENT_CONFIG
           type: File
       - name: docker-sock
         hostPath:
