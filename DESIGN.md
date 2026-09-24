@@ -39,6 +39,39 @@ One command. Hermes Agent on DeepSeek — contained in Docker. Multiple agents b
 - `SUDO_PASSWORD` env var set — agent can `sudo` anything
 - **Cannot reach the host** — Docker security boundary
 
+## MCP Service
+
+Each `sudo-{name}` pod runs an MCP server (streamable HTTP) that wraps the
+`hermes-p` prompt surface. It is deployed by `up.sh` as part of the same
+generated YAML, and runs inside the pod (as the `hermes` user, `HOME=/opt/data`),
+so it prompts that pod's own agent directly — no kubectl, no kubeconfig, no
+cross-agent routing.
+
+- **Service**: `sudo-{name}-mcp` (ClusterIP). Stable client-facing port `8000`,
+  targetPort a unique per-agent port (derived from the agent name) because every
+  sudo-agent pod runs `hostNetwork: true` and a fixed port would collide.
+- **URL**: `http://sudo-{name}-mcp:8000/mcp`
+- **Tool**: `hermes_prompt(prompt, json=false)` — the functional surface of
+  hermes-p.py (`prompt` / `--json`). `hermes -z` is stateless per invocation, so
+  there is no conversation resume. `--stream` / `--new-chat` are CLI-parity
+  no-ops and are not exposed as tool params.
+- **Single source of truth**: `kube-scripts/hermes_prompt.py` holds the hermes
+  `-z` command construction, the JSON pass-through formatting, and the host-side
+  agent listing / name resolution. Both `hermes-p.py` (host CLI) and
+  `mcp_server.py` (in-pod MCP) import it.
+- **Process model** (differs from sudo-letta): the sudo-agent image has no own
+  CMD/entrypoint — `up.sh` runs the base image's `gateway run` via `args`, and
+  that long-running gateway is the pod's main process. So the image sets a
+  supervisor `ENTRYPOINT` (`mcp_entrypoint.sh`) that starts the MCP server in a
+  restart loop in the background, then execs the base entrypoint so `gateway
+  run` still runs as the main process under the s6-overlay supervision tree.
+- **Image**: `hermes_prompt.py`, `mcp_server.py`, and `mcp_entrypoint.sh` are
+  copied into the image at `/opt/hermes-mcp/` (plus `fastmcp` installed into
+  `/opt/hermes/.venv` via `uv pip install`).
+- **Limitation**: `--list` / cross-agent name resolution is host-side only
+  (needs `kubectl`/kubeconfig) and is intentionally not exposed by the per-pod
+  MCP.
+
 ## What --privileged Enables
 
 - `mount` / `umount` — FUSE, tmpfs, bind mounts

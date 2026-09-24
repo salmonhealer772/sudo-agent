@@ -32,71 +32,25 @@ Why the plumbing is the way it is (hard-won):
   - `hermes -z` is stateless per invocation: no conversationId/settings.json to
     resume and no stream-json delta mode, so --new-chat and --stream are accepted
     for CLI parity but are no-ops.
+
+The hermes -z argv construction, JSON pass-through formatting, host-side agent
+listing, and grep-style name resolution all live in the shared module
+`hermes_prompt` (imported here), so this CLI and the per-pod MCP server
+(kube-scripts/mcp_server.py) share one source of truth.
 """
 
 import argparse
-import json
 import subprocess
 import sys
 
-KUBECTL = "kubectl"
-
-
-def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
-
-
-def list_agents():
-    """Return the bare agent names for all running sudo-agent deployments."""
-    proc = subprocess.run(
-        [KUBECTL, "get", "deploy", "-l", "app=sudo-agent",
-         "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        eprint("error: failed to list deployments:", proc.stderr.strip())
-        sys.exit(proc.returncode)
-    names = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("sudo-"):
-            names.append(line[len("sudo-"):])
-    return sorted(names)
-
-
-def resolve_name(input_name):
-    """Resolve a user-supplied name to a bare agent name via grep-style matching.
-
-    The real deployments are `sudo-<bare-name>`; a bare name is the deployment
-    name minus ONE leading "sudo-". Some bare names legitimately START with
-    "sudo-" (e.g. the maintainer pair: bare `sudo-agent-maintainer-h` lives at
-    deploy `sudo-sudo-agent-maintainer-h`), so we must NOT blindly strip a leading
-    "sudo-" from the input. Instead:
-
-      1. Exact match (case-insensitive) against a bare name -> return it.
-      2. Otherwise substring (grep-style) match: bare names whose lowercase form
-         CONTAINS the lowercase input.
-         - exactly one  -> return it
-         - zero         -> error + exit 1
-         - multiple     -> error listing the candidates + exit 1
-    """
-    bare_names = list_agents()
-    lowered = input_name.lower()
-
-    # 1) exact match (case-insensitive)
-    for bare in bare_names:
-        if bare.lower() == lowered:
-            return bare
-
-    # 2) substring (grep-style) match
-    matches = [bare for bare in bare_names if lowered in bare.lower()]
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        eprint(f"no sudo-agent agent matches '{input_name}' (try --list)")
-        sys.exit(1)
-    eprint(f"multiple agents match '{input_name}': {', '.join(matches)}")
-    sys.exit(1)
+from hermes_prompt import (
+    KUBECTL,
+    build_hermes_command,
+    eprint,
+    format_reply,
+    list_agents,
+    resolve_name,
+)
 
 
 def run_prompt(name, prompt, as_json, as_stream=False, as_new_chat=False):
@@ -106,10 +60,7 @@ def run_prompt(name, prompt, as_json, as_stream=False, as_new_chat=False):
     # from letta-p.py does not apply here — --new-chat is accepted as a harmless
     # no-op. Likewise hermes -z has no stream-json delta mode, so --stream follows
     # the default path (run hermes -z and print stdout) below.
-    cmd = [
-        KUBECTL, "exec", f"deploy/{deploy}", "--",
-        "hermes", "-z", prompt,
-    ]
+    cmd = [KUBECTL, "exec", f"deploy/{deploy}", "--"] + build_hermes_command(prompt)
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -117,22 +68,9 @@ def run_prompt(name, prompt, as_json, as_stream=False, as_new_chat=False):
         eprint(proc.stderr.strip() or proc.stdout.strip())
         sys.exit(proc.returncode)
 
-    out = proc.stdout.strip()
-    if not out:
-        return
-
-    if as_json:
-        # hermes -z prints the reply to stdout with no --output-format equivalent.
-        # If the output happens to be valid JSON, pretty-print it; otherwise pass
-        # the raw text through unchanged.
-        try:
-            parsed = json.loads(out)
-        except json.JSONDecodeError:
-            print(out)  # fall back to raw
-            return
-        print(json.dumps(parsed, indent=2))
-    else:
-        print(out)
+    reply = format_reply(proc.stdout, as_json)
+    if reply:
+        print(reply)
 
 
 def main():

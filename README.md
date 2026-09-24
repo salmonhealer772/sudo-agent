@@ -66,6 +66,30 @@ The sudo password is random 16-char alphanumeric, generated on first `up.sh`, sa
 - Run local LLMs — DeepSeek API only
 - Multi-agent orchestration between containers — single agent per container
 
+## MCP Service (every pod)
+
+Every sudo-agent pod runs a per-pod **MCP (Model Context Protocol) server** that
+exposes the `hermes-p.py` prompt surface over HTTP — a thin wrapper with the
+same functionality and nothing more. It is fronted by a Kubernetes Service named
+`sudo-<name>-mcp`.
+
+- **Endpoint** (streamable HTTP, from inside the cluster):
+  `http://sudo-<name>-mcp:8000/mcp`
+- **Tool**: `hermes_prompt`
+  - `prompt` (string, required) — the message to send
+  - `json` (bool, default false) — pretty-print the reply iff stdout is valid
+    JSON, else pass the raw text through unchanged (maps to `--json`)
+- **Semantics**: a one-shot prompt to *that pod's own* agent. The MCP server
+  invokes `hermes -z PROMPT` directly inside the pod (no kubectl). `hermes -z`
+  is stateless per invocation, so there is no conversation resume.
+- **Port**: the Service exposes a stable port `8000`; internally each pod
+  listens on a unique per-agent port (auto-derived from the agent name) because
+  every sudo-agent pod runs `hostNetwork: true` and a fixed port would collide.
+- **Not exposed**: `--list` / cross-agent name resolution — that requires
+  `kubectl`/kubeconfig and remains host-side (`kube-scripts/hermes-p.py --list`).
+  `--stream` / `--new-chat` are CLI-parity no-ops for `hermes -z` and are not
+  MCP tool params.
+
 ## Stack
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research — the agent framework

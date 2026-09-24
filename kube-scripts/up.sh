@@ -34,6 +34,13 @@ DEPLOY="sudo-$NAME"
 YAML="$YAML_DIR/$NAME.yaml"
 PER_AGENT_CONFIG="$CONFIG_DIR/$NAME.yaml"
 
+# Per-agent MCP server port. Every sudo-agent pod runs hostNetwork:true, so all
+# pods share the node's network namespace and a single fixed port would collide.
+# Derive a stable, unique port from the agent name (stays below the ephemeral
+# range, 32768+). The Service below exposes a stable port 8000 and forwards
+# (targetPort) to this unique per-agent port.
+MCP_PORT=$(( 8000 + $(printf '%s' "$NAME" | cksum | cut -d' ' -f1) % 24768 ))
+
 # If repo is root-owned and we're not root, bail early
 if [[ ! -w "$REPO_DIR" ]] && [[ "$(id -u)" != "0" ]]; then
   echo "Repo is root-owned. Run with: sudo bash kube-scripts/up.sh --$NAME" >&2
@@ -146,6 +153,8 @@ spec:
           value: "$SUDO_PASS"
         - name: HERMES_YOLO_MODE
           value: "true"
+        - name: MCP_PORT
+          value: "$MCP_PORT"
         volumeMounts:
         - name: data
           mountPath: /opt/data
@@ -165,6 +174,23 @@ spec:
         hostPath:
           path: /var/run/docker.sock
           type: Socket
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: $DEPLOY-mcp
+  labels:
+    app: sudo-agent
+    agent: $NAME
+spec:
+  type: ClusterIP
+  selector:
+    app: sudo-agent
+    agent: $NAME
+  ports:
+  - name: mcp
+    port: 8000
+    targetPort: $MCP_PORT
 YAMLEOF
 
 if [[ ! -s "$YAML" ]]; then
@@ -199,5 +225,6 @@ echo ""
 echo "✓ $DEPLOY deployed"
 echo "  Talk:   kubectl exec -it deploy/$DEPLOY -- hermes"
 echo "  Shell:  kubectl exec -it deploy/$DEPLOY -- bash"
+echo "  MCP:    http://$DEPLOY-mcp:8000/mcp"
 echo "  Logs:   kubectl logs deploy/$DEPLOY -f"
 echo "  Stop:   bash kube-scripts/down.sh --$NAME"
