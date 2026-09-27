@@ -143,6 +143,38 @@ if [[ ! -f "$WATCH_SIDECAR" ]]; then
   exit 1
 fi
 
+# ── Preserve operator-added env vars ─────────────────────────────────────────
+# up.sh REGENERATES this Deployment from the template below, so the live object
+# is REPLACED, not merged. Any env var an operator added to the running
+# deployment by hand (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, API_SERVER_* ...)
+# would otherwise be silently DROPPED on the next roll — a deploy that quietly
+# strips a live credential or an API server, the same class of silent breakage
+# the queue wiring above exists to prevent. Carry forward every env entry on
+# the agent container that the template does not itself define.
+#   * Agent container only: the watch container's env has always been fully
+#     template-owned, so it has no extras to lose.
+#   * Extras are only read when the Deployment already exists. On a first
+#     deploy there is nothing to preserve, and a failed read yields no extras
+#     (the old behaviour) instead of aborting the roll.
+#   * Values are re-emitted through jq tojson, i.e. as YAML double-quoted
+#     scalars, so a value like `true` stays the string "true".
+TEMPLATE_ENV_NAMES='["DEEPSEEK_API_KEY","SUDO_PASSWORD","HERMES_YOLO_MODE","MCP_PORT","AGENT_NAME","REDIS_URL"]'
+EXTRA_ENV="$(kubectl get deploy "$DEPLOY" -o json 2>/dev/null \
+  | jq -r --argjson known "$TEMPLATE_ENV_NAMES" '
+      .spec.template.spec.containers[]
+      | select(.name == "sudo-agent")
+      | .env[]?
+      | select(.name as $n | ($known | index($n)) | not)
+      | if .valueFrom
+        then "        - name: \(.name)\n          valueFrom: \(.valueFrom | tojson)"
+        else "        - name: \(.name)\n          value: \(.value | tojson)"
+        end
+    ' 2>/dev/null || true)"
+if [[ -n "$EXTRA_ENV" ]]; then
+  echo "→ Preserving operator-added env from the live deployment:" >&2
+  awk '/- name:/{printf "    %s\n", $3}' <<<"$EXTRA_ENV" >&2
+fi
+
 # ── Generate YAML ──
 echo "→ Writing $YAML..."
 cat > "$YAML" <<YAMLEOF
@@ -209,6 +241,7 @@ spec:
         # resolve. See kube-scripts/redis-up.sh.
         - name: REDIS_URL
           value: $REDIS_URL
+$EXTRA_ENV
         volumeMounts:
         - name: data
           mountPath: /opt/data
