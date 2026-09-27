@@ -30,7 +30,7 @@ FILTER="$(mktemp /tmp/stream-filter.XXXXXX.py)"
 STREAM_OUT=""
 CURLOPTS=""
 
-die() { rm -f "$FILTER" "$FIFO" 2>/dev/null; printf '%s\n' "$*" >&2; exit 1; }
+die() { rm -f "$FILTER" "${FIFO:-}" 2>/dev/null; printf '%s\n' "$*" >&2; exit 1; }
 cleanup() {
   trap - INT TERM EXIT
   # Best-effort child cleanup for non-interactive termination (timeout/kill):
@@ -41,7 +41,7 @@ cleanup() {
   done
   pkill -TERM -P $$ 2>/dev/null
   wait 2>/dev/null
-  rm -f "$FILTER" "$FIFO" 2>/dev/null
+  rm -f "$FILTER" "${FIFO:-}" 2>/dev/null
 }
 trap 'cleanup' INT TERM EXIT
 
