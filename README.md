@@ -158,8 +158,10 @@ backing. See `DESIGN.md` for the full topology and the hostNetwork design rules.
 - Changing `kube-scripts/mcp_server.py`, `mcp_entrypoint.sh`, `hermes_prompt.py`,
   `Dockerfile` or `patch_memory_review.py` means the **image** must be rebuilt
   (`docker build -t sudo-agent:latest -f Dockerfile .`) before deploying;
-  `up.sh` refuses to deploy `sudo-agent:latest` when it is older than those
-  sources (`SUDO_AGENT_ALLOW_STALE_IMAGE=1` overrides).
+  `up.sh` refuses to deploy `sudo-agent:latest` when the **content** of
+  `mcp_server.py` / `hermes_prompt.py` / `mcp_entrypoint.sh` differs from what is
+  baked into the image (a digest comparison, so a `touch` or a fresh clone is not
+  a false alarm). `SUDO_AGENT_ALLOW_STALE_IMAGE=1` overrides it.
 
 ## Why not eliza-gbrain-docker?
 

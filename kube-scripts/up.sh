@@ -367,33 +367,61 @@ _import_image() {
   echo "→ $img present in containerd"
 }
 
-# The image the pods RUN must be newer than the sources baked into it, or the
-# deploy ships a pod without the code you just changed. Loud, with an override.
+# The image the pods RUN must actually CONTAIN the sources baked into it, or the
+# deploy ships a pod without the code you just changed. Compared by CONTENT (a
+# digest of the three files COPYed into the image), not by mtime: an mtime check
+# raises false alarms on a touch or a fresh clone, and — worse — a no-op rebuild
+# is a build-cache hit that does NOT refresh the image timestamp, so the alarm
+# could never be cleared. Loud, with an explicit override.
+_src_digest() {
+  # $1 = directory holding the three files the Dockerfile COPYs into the image
+  sha256sum "$1/hermes_prompt.py" "$1/mcp_server.py" "$1/mcp_entrypoint.sh" 2>/dev/null \
+    | awk '{print $1}' | sha256sum | awk '{print $1}'
+}
+
+_image_digest() {
+  docker run --rm --entrypoint sha256sum "$1" \
+    /opt/hermes-mcp/hermes_prompt.py \
+    /opt/hermes-mcp/mcp_server.py \
+    /opt/hermes-mcp/mcp_entrypoint.sh 2>/dev/null \
+    | awk '{print $1}' | sha256sum | awk '{print $1}'
+}
+
 _assert_image_fresh() {
-  local img="sudo-agent:latest" created created_epoch=0 newest=0 f m
-  created="$(docker image inspect "$img" --format '{{.Created}}' 2>/dev/null)" || {
+  local img="sudo-agent:latest" want got
+  if ! docker image inspect "$img" >/dev/null 2>&1; then
     echo "✗ FATAL: docker image $img not found locally. Build it first:" >&2
     echo "    docker build -t $img -f \"$REPO_DIR/Dockerfile\" \"$REPO_DIR\"   (or bash setup.sh)" >&2
     exit 1
-  }
-  created_epoch="$(date -d "$created" +%s 2>/dev/null || echo 0)"
-  for f in "$REPO_DIR/Dockerfile" "$REPO_DIR/patch_memory_review.py" \
-           "$SCRIPT_DIR/hermes_prompt.py" "$SCRIPT_DIR/mcp_server.py" \
-           "$SCRIPT_DIR/mcp_entrypoint.sh"; do
-    [[ -f "$f" ]] || continue
-    m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
-    if (( m > newest )); then newest=$m; fi
-  done
-  if (( created_epoch < newest )); then
+  fi
+  want="$(_src_digest "$SCRIPT_DIR")"
+  got="$(_image_digest "$img")"
+  if [[ -z "$got" || -z "$want" ]]; then
+    echo "⚠ could not read the MCP files out of $img — skipping the image-freshness check" >&2
+  elif [[ "$want" != "$got" ]]; then
     if [[ "${SUDO_AGENT_ALLOW_STALE_IMAGE:-}" == "1" ]]; then
-      echo "⚠ $img is OLDER than its source files — proceeding only because SUDO_AGENT_ALLOW_STALE_IMAGE=1" >&2
+      echo "⚠ $img does NOT contain the current sources — proceeding only because SUDO_AGENT_ALLOW_STALE_IMAGE=1" >&2
     else
-      echo "✗ FATAL: $img was built $(date -d @"$created_epoch" '+%Y-%m-%d %H:%M:%S') but its sources changed $(date -d @"$newest" '+%Y-%m-%d %H:%M:%S')." >&2
+      echo "✗ FATAL: $img does not contain the current mcp_server.py / hermes_prompt.py /" >&2
+      echo "  mcp_entrypoint.sh (repo digest $want, image digest $got)." >&2
       echo "  The pod would run WITHOUT your latest code (imagePullPolicy: IfNotPresent)." >&2
       echo "  Rebuild:  docker build -t $img -f \"$REPO_DIR/Dockerfile\" \"$REPO_DIR\"" >&2
       echo "  Override: SUDO_AGENT_ALLOW_STALE_IMAGE=1 bash kube-scripts/up.sh --$NAME" >&2
       exit 1
     fi
+  fi
+  # Secondary, advisory only: the Dockerfile / memory patcher are not readable
+  # from the image, so fall back to a timestamp note for those two.
+  local created_epoch=0 newest=0 f m created
+  created="$(docker image inspect "$img" --format '{{.Created}}' 2>/dev/null || true)"
+  created_epoch="$(date -d "$created" +%s 2>/dev/null || echo 0)"
+  for f in "$REPO_DIR/Dockerfile" "$REPO_DIR/patch_memory_review.py"; do
+    [[ -f "$f" ]] || continue
+    m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+    if (( m > newest )); then newest=$m; fi
+  done
+  if (( created_epoch > 0 && newest > created_epoch )); then
+    echo "⚠ note: $img predates $REPO_DIR/Dockerfile or patch_memory_review.py; rebuild if you changed them" >&2
   fi
 }
 
