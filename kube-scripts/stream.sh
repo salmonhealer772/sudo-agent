@@ -162,6 +162,12 @@ done
 BARE="$(resolve_name "$NAME")" || die ""
 DEPLOY="sudo-${BARE}"
 
+# Sidecar guard: a clear error instead of a silent exit if this agent has
+# not been rolled with the observer sidecar yet (no 'watch' container).
+if ! kubectl get "deploy/${DEPLOY}" -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null | grep -qw watch; then
+  die "no watch sidecar on this agent yet (not rolled?)"
+fi
+
 # ── the stream: kubectl tail -f piped through the pretty-printer ───────────
 # Both children run in the BACKGROUND and we `wait` on them; this is what
 # makes Ctrl-C return the prompt INSTANTLY:
