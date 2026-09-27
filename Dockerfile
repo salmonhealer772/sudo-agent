@@ -11,6 +11,7 @@ RUN apt-get update && \
       sudo \
       fuse3 \
       fuse \
+      redis-server \
       && \
     rm -rf /var/lib/apt/lists/* && \
     echo "hermes ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/hermes && \
@@ -36,6 +37,9 @@ RUN . /opt/hermes/.venv/bin/activate && uv pip install ddgs
 # "no version of fastmcp==4.0.9". We pin fastmcp exactly (a reviewed pin), so
 # override the window with a fixed future date to let the resolver see 4.0.9.
 RUN . /opt/hermes/.venv/bin/activate && uv pip install --exclude-newer 2026-12-31 fastmcp==4.0.9
+# Prompt-distributor queue: redis-py client (the per-pod redis-server
+# binary itself is apt-installed above; started by mcp_entrypoint.sh).
+RUN . /opt/hermes/.venv/bin/activate && uv pip install redis
 COPY kube-scripts/hermes_prompt.py /opt/hermes-mcp/hermes_prompt.py
 COPY kube-scripts/mcp_server.py /opt/hermes-mcp/mcp_server.py
 COPY kube-scripts/mcp_entrypoint.sh /opt/hermes-mcp/mcp_entrypoint.sh

@@ -75,13 +75,26 @@ same functionality and nothing more. It is fronted by a Kubernetes Service named
 
 - **Endpoint** (streamable HTTP, from inside the cluster):
   `http://sudo-<name>-mcp:8000/mcp`
-- **Tool**: `hermes_prompt`
+- **Tool**: `hermes_prompt` — routed through the prompt distributor:
   - `prompt` (string, required) — the message to send
   - `json` (bool, default false) — pretty-print the reply iff stdout is valid
     JSON, else pass the raw text through unchanged (maps to `--json`)
-- **Semantics**: a one-shot prompt to *that pod's own* agent. The MCP server
-  invokes `hermes -z PROMPT` directly inside the pod (no kubectl). `hermes -z`
-  is stateless per invocation, so there is no conversation resume.
+  - `mode` (`"direct"` default | `"inbox"`) — direct = enqueue and WAIT for
+    the reply (no timeout, safe for long jobs); inbox = enqueue and get a
+    stable message id back immediately (a `check(message_id)` tool can be
+    added later without breaking changes)
+  - `source` (string, optional) — the enqueuing client/session id; the
+    ordering rule groups by source (the first source's backlog is drained
+    fully before the next most recent source). Defaults to the MCP session
+    id.
+- **Tool**: `hermes_queue_status` — pending queue + recent processed results
+  (the observability window into the distributor).
+- **Semantics**: prompts are enqueued in the pod's own localhost Redis and
+  fed to the agent strictly ONE at a time by a single in-pod drain worker —
+  never concurrent, never dropped (N rapid prompts = N queued runs, not N
+  parallel runs racing the same agent state). `hermes -z` is stateless per
+  invocation, so there is no conversation resume. Per-pod Redis (AOF on,
+  data on the agent PVC) — see OBSERVABILITY.md for the durability caveat.
 - **Port**: the Service exposes a stable port `8000`; internally each pod
   listens on a unique per-agent port (auto-derived from the agent name) because
   every sudo-agent pod runs `hostNetwork: true` and a fixed port would collide.

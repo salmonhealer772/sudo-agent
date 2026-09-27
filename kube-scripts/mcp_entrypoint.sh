@@ -8,27 +8,61 @@
 # gateway WITHOUT replacing it.
 #
 # This script is the image ENTRYPOINT. It:
-#   1. starts the MCP server (the FastMCP streamable-HTTP wrapper over hermes-p)
-#      in the background, in a restart loop so a crash doesn't take the endpoint
-#      down permanently; then
-#   2. execs the base image's entrypoint dispatcher with the original args
+#   1. starts the per-pod Redis (the prompt distributor's backing store;
+#      localhost-only, unique REDIS_PORT, AOF on) in the background;
+#   2. starts the MCP server (the FastMCP streamable-HTTP wrapper over
+#      hermes-p) in the background, in a restart loop so a crash doesn't take
+#      the endpoint down permanently;
+#   3. execs the base image's entrypoint dispatcher with the original args
 #      (`gateway run`), so the gateway starts EXACTLY as before under the
 #      s6-overlay supervision tree.
 #
-# The MCP server runs as the hermes user (uid 10000, HOME=/opt/data) so its
-# `hermes -z` subprocesses and any files it writes are uid-aligned with the
-# supervised gateway — the same ownership the existing
+# The MCP server (and its drain worker) runs as the hermes user (uid 10000,
+# HOME=/opt/data) so its `hermes -z` subprocesses and any files it writes are
+# uid-aligned with the supervised gateway — the same ownership the existing
 # `kubectl exec ... hermes -z` flow relies on. MCP_PORT is the per-agent port
-# (unique because every sudo-agent pod runs hostNetwork:true and would otherwise
-# collide); it defaults to 8000 and is normally injected by up.sh.
+# (unique because every sudo-agent pod runs hostNetwork:true and would
+# otherwise collide); it defaults to 8000 and is normally injected by up.sh.
+# REDIS_PORT follows the same hostNetwork collision rules.
+#
+# Redis data dir: /opt/data/redis/ (the agent PVC) — see the AOF caveat in
+# mcp_server.py's docstring: container restarts keep the queue; a pod
+# RECREATION (which gets a fresh PVC-backed dir but a NEW container root)
+# keeps /opt/data/redis too, so in practice the queue survives pod
+# recreation as long as the PVC persists; only losing the PVC loses it.
 
 set -u
 
 PORT="${MCP_PORT:-8000}"
+RPORT="${REDIS_PORT:-6379}"
+
+mkdir -p /opt/data/redis 2>/dev/null || true
+
+# Per-pod Redis for the prompt distributor. Bound to 127.0.0.1 ONLY (pods run
+# hostNetwork:true, so binding anything else would expose the queue to every
+# pod on the node). AOF persistence ON. Runs as hermes (uid 10000) so the AOF
+# files on the PVC are owned by the agent uid. Also run in a restart loop so a
+# Redis crash cannot take the distributor down permanently.
+(
+  while :; do
+    HOME=/opt/data /command/s6-setuidgid hermes \
+      redis-server \
+        --port "$RPORT" \
+        --bind 127.0.0.1 \
+        --protected-mode yes \
+        --appendonly yes \
+        --appendfsync everysec \
+        --dir /opt/data/redis \
+        --dbfilename dump.rdb \
+        --logfile /opt/data/redis/redis.log \
+        --daemonize no || true
+    sleep 2
+  done
+) &
 
 (
   while :; do
-    HOME=/opt/data HERMES_HOME=/opt/data \
+    HOME=/opt/data HERMES_HOME=/opt/data MCP_PORT="$PORT" REDIS_PORT="$RPORT" \
       /command/s6-setuidgid hermes \
       /opt/hermes/.venv/bin/python /opt/hermes-mcp/mcp_server.py || true
     sleep 2

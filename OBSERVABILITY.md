@@ -105,6 +105,45 @@ talks to this agent via the api_server, its prompts will currently land in
 the transcript as if the operator wrote them; say the word and we tighten
 the mapping.
 
+## Prompt distributor (queue)
+
+Between the agent's MCP door and the agent's brain sits a Redis-backed
+prompt distributor. `hermes_prompt` on the per-pod MCP NO LONGER spawns
+`hermes -z` immediately; it enqueues into the pod's own localhost Redis and a
+single drain worker feeds the agent ONE prompt at a time (never concurrent,
+never dropped).
+
+- **Backing store**: per-pod Redis on 127.0.0.1, unique `REDIS_PORT` per
+  agent (same cksum-hash scheme as MCP_PORT/WATCH_PORT, hashed from
+  `<name>-redis`). AOF ON, data dir `/opt/data/redis/` on the agent PVC.
+- **Durability caveat**: the AOF lives on the agent PVC, so container
+  restarts and pod recreation keep the queue as long as the PVC persists;
+  only deleting the PVC loses it. If cross-pod durability is ever needed,
+  that is the moment to reconsider a shared Redis.
+- **Keys**: `sudo-agent:q:<pod>:items` / `sudo-agent:q:<pod>:res:<msg-id>` —
+  namespaced away from state.db and the watch sidecar's concerns.
+- **Ordering rule** (one-at-a-time drain): first message in is processed
+  first; that source's entire backlog is drained before anyone else; then
+  the next most recently active source, fully; FIFO within each source.
+- **Tools**: `hermes_prompt(prompt, json, mode, source)` — `mode` is
+  `direct` (enqueue + wait for the reply, no timeout) or `inbox` (enqueue +
+  stable message id back immediately); `source` is the enqueuing
+  client/session id (defaults to the MCP session id). `hermes_queue_status()`
+  — pending queue + recent processed results (ids, sources, timestamps).
+
+Watch it live (from the host):
+
+```bash
+# queue status over the MCP Service
+kubectl run -q --rm qstat-$$ --image=curlimages/curl --restart=Never --   curl -s -X POST http://sudo-<name>-mcp:8000/mcp 2>/dev/null || true
+# or read the Redis keys directly inside the pod
+kubectl exec deploy/sudo-<name> -c sudo-agent --   redis-cli -p <REDIS_PORT> --scan --pattern 'sudo-agent:q:*'
+```
+
+The drain worker's processed records (`started_at`/`finished_at` per message
+id) are the authoritative one-at-a-time evidence — see the `results` array of
+`hermes_queue_status`.
+
 ## Ops notes
 
 - Spec changes need pod RECREATION via `up.sh` — `kubectl rollout restart`

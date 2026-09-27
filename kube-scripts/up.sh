@@ -50,6 +50,15 @@ if [[ "$WATCH_PORT" == "$MCP_PORT" ]]; then
   WATCH_PORT=$(( MCP_PORT + 1 ))
 fi
 
+# Per-agent REDIS (prompt-distributor queue) port — same hostNetwork
+# collision rules, hashed from a DIFFERENT string ("$NAME-redis"). Redis binds
+# 127.0.0.1 only, but the LISTENING port still lives in the shared node netns,
+# so it must be unique per agent like MCP_PORT/WATCH_PORT.
+REDIS_PORT=$(( 8000 + $(printf '%s-redis' "$NAME" | cksum | cut -d' ' -f1) % 24768 ))
+if [[ "$REDIS_PORT" == "$MCP_PORT" || "$REDIS_PORT" == "$WATCH_PORT" ]]; then
+  REDIS_PORT=$(( REDIS_PORT + 2 ))
+fi
+
 # If repo is root-owned and we're not root, bail early
 if [[ ! -w "$REPO_DIR" ]] && [[ "$(id -u)" != "0" ]]; then
   echo "Repo is root-owned. Run with: sudo bash kube-scripts/up.sh --$NAME" >&2
@@ -172,6 +181,8 @@ spec:
           value: "true"
         - name: MCP_PORT
           value: "$MCP_PORT"
+        - name: REDIS_PORT
+          value: "$REDIS_PORT"
         volumeMounts:
         - name: data
           mountPath: /opt/data
