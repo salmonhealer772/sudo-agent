@@ -109,35 +109,51 @@ the mapping.
 
 Between the agent's MCP door and the agent's brain sits a Redis-backed
 prompt distributor. `hermes_prompt` on the per-pod MCP NO LONGER spawns
-`hermes -z` immediately; it enqueues into the pod's own localhost Redis and a
-single drain worker feeds the agent ONE prompt at a time (never concurrent,
-never dropped).
+`hermes -z` immediately; it enqueues into the SHARED fleet Redis
+(`sudo-agent-redis`) and a single in-pod drain worker feeds the agent ONE
+prompt at a time (never concurrent, never dropped).
 
-- **Backing store**: shared sudo-agent-redis on 127.0.0.1, unique `REDIS_PORT` per
-  agent (same cksum-hash scheme as MCP_PORT/WATCH_PORT, hashed from
-  `<name>-redis`). AOF ON, data dir `/opt/data/redis/` on the agent PVC.
-- **Durability caveat**: the AOF lives on the agent PVC, so container
-  restarts and pod recreation keep the queue as long as the PVC persists;
-  only deleting the PVC loses it. If cross-pod durability is ever needed,
-  that is the moment to reconsider a shared Redis.
-- **Keys**: `sudo-agent:q:<pod>:items` / `sudo-agent:q:<pod>:res:<msg-id>` —
-  namespaced away from state.db and the watch sidecar's concerns.
+- **Backing store**: shared `sudo-agent-redis`, reached as
+  `redis://127.0.0.1:6380/0` (`SUDO_AGENT_REDIS_PORT` overrides; `up.sh` injects
+  the matching `REDIS_URL`). It runs `hostNetwork: true` bound to the node's
+  loopback because every agent pod is hostNetwork too — a hostNetwork pod gets
+  the NODE resolver, not cluster DNS, so a Service name never resolves.
+  Provisioned by `kube-scripts/redis-up.sh` (idempotent; run by `up.sh` and
+  `setup.sh`). Its port is NODE-GLOBAL: Hermes owns **6380**, `sudo-letta-redis`
+  owns **6379**; `redis-up.sh` preflights and aborts loudly on a foreign owner.
+- **Durability**: PVC `sudo-agent-redis-data` with AOF on
+  (`appendfsync everysec`), so the queue survives agent pod recreation AND
+  Redis pod recreation; only losing the PVC loses it.
+- **Offline fallback**: when `REDIS_URL` is unset the entrypoint starts a
+  per-pod Redis on a port derived per agent
+  (`40000 + (MCP_PORT*7) % 20000`, never 6379/6380), AOF on, data dir
+  `/opt/data/redis/` on the agent PVC.
+- **Keys**: `sudo-agent:q:<agent>:items` / `:inflight` / `:res:<msg-id>` —
+  namespaced per agent (the fleet shares one Redis) and away from state.db and
+  the watch sidecar's concerns.
 - **Ordering rule** (one-at-a-time drain): first message in is processed
   first; that source's entire backlog is drained before anyone else; then
   the next most recently active source, fully; FIFO within each source.
+- **Atomic claim**: the worker takes the next item in ONE Redis transaction
+  (`WATCH`/`MULTI`: remove from `:items`, push to `:inflight`), so exactly-one-
+  at-a-time is enforced by Redis rather than by Python timing, the in-flight
+  item is no longer reported as pending, and a crash cannot re-run it twice.
+  Items abandoned in `:inflight` by a hard crash are requeued (order preserved)
+  on the worker's next connect — at-least-once, never a silent drop.
 - **Tools**: `hermes_prompt(prompt, json, mode, source)` — `mode` is
   `direct` (enqueue + wait for the reply, no timeout) or `inbox` (enqueue +
-  stable message id back immediately); `source` is the enqueuing
+  stable `msg-<12hex>` id back immediately); `source` is the enqueuing
   client/session id (defaults to the MCP session id). `hermes_queue_status()`
-  — pending queue + recent processed results (ids, sources, timestamps).
+  — in-flight item + pending queue + recent processed results (ids, sources,
+  timestamps), and the Redis URL actually in use.
 
 Watch it live (from the host):
 
 ```bash
 # queue status over the MCP Service
 kubectl run -q --rm qstat-$$ --image=curlimages/curl --restart=Never --   curl -s -X POST http://sudo-<name>-mcp:8000/mcp 2>/dev/null || true
-# or read the Redis keys directly inside the pod
-kubectl exec deploy/sudo-<name> -c sudo-agent --   redis-cli -p <REDIS_PORT> --scan --pattern 'sudo-agent:q:*'
+# or read the shared Redis directly (hostNetwork pods: 127.0.0.1 on the NODE)
+kubectl exec deploy/sudo-<name> -c sudo-agent --   /opt/hermes/.venv/bin/python -c "import redis;r=redis.Redis(decode_responses=True);print(r.ping(), r.info('server')['run_id'])"
 ```
 
 The drain worker's processed records (`started_at`/`finished_at` per message
@@ -157,8 +173,12 @@ id) are the authoritative one-at-a-time evidence — see the `results` array of
 
 
 ## Queue backing (shared Redis)
+
 The prompt-distributor queue is backed by the shared `sudo-agent-redis`
-service (`REDIS_URL=redis://sudo-agent-redis:6379/0`), deployed by
-`kube-scripts/redis-up.sh` with its own PVC and AOF persistence on — the
-queue survives agent pod recreation AND redis pod recreation. Per-pod
-localhost Redis remains as an offline fallback when `REDIS_URL` is unset.
+(`REDIS_URL=redis://127.0.0.1:6380/0`, injected by `up.sh`), deployed by
+`kube-scripts/redis-up.sh` with its own PVC and AOF persistence on — the queue
+survives agent pod recreation AND redis pod recreation. It runs
+`hostNetwork: true` because a hostNetwork agent pod has no cluster DNS (see
+DESIGN.md), so it is reached on the NODE's loopback, never by Service name.
+Per-pod localhost Redis remains as an offline fallback when `REDIS_URL` is
+unset, on a per-agent-derived port (never 6379/6380).
