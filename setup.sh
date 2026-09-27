@@ -2,6 +2,11 @@
 set -uo pipefail
 
 # sudo-agent/setup.sh — One-time setup: builds Docker image, prompts for DeepSeek API key.
+#
+# NOTE ON PATHS: this repo has TWO deploy paths. `kube-scripts/` is the real
+# k3s path (MCP service, prompt-distributor queue, observer sidecar).
+# `scripts/` is the LEGACY plain-Docker path and has NONE of that work — it
+# deploys de-modded, queueless agents. The hints below point at kube-scripts/.
 
 echo "┌─────────────────────────────────────────────┐"
 echo "│  sudo-agent — Hermes Agent with root cage   │"
@@ -92,9 +97,34 @@ else
   sed -i '/^  base_url:/d' "$CONFIG_FILE"
 fi
 
+# --- Shared Redis for the prompt-distributor queue ---
+# The queue that serializes concurrent prompts into the agent lives in a SHARED
+# Redis (one per fleet, hostNetwork on the node loopback, PVC-backed). It must
+# exist BEFORE agents do, so provision it at setup time too — up.sh does the
+# same on every deploy, which is what keeps it propagated. Loud on failure: a
+# fleet without its queue backing has a dead prompt path.
+if command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1; then
+  echo ""
+  echo "→ Provisioning the shared queue Redis (kube-scripts/redis-up.sh)..."
+  if ! bash "$SCRIPT_DIR/kube-scripts/redis-up.sh"; then
+    echo "✗ FAILED to provision the shared Redis (kube-scripts/redis-up.sh)." >&2
+    echo "  Setup aborted: agents deployed without it would have a dead prompt queue." >&2
+    exit 1
+  fi
+  echo "✓ Shared queue Redis ready (sudo-agent-redis)"
+else
+  echo ""
+  echo "⚠ No reachable Kubernetes cluster (kubectl missing, or 'kubectl cluster-info' failed)."
+  echo "  The shared queue Redis is provisioned automatically by the first deploy:"
+  echo "    bash kube-scripts/up.sh --<name>"
+fi
+
 echo ""
 echo "✓ Setup complete"
 echo ""
-echo "  bash scripts/up.sh --fish      # start agent (generates sudo password)"
-echo "  bash scripts/talk.sh --fish    # talk to agent"
-echo "  bash scripts/down.sh --fish    # stop agent"
+echo "  bash kube-scripts/up.sh --fish    # start agent (k3s; provisions the queue Redis)"
+echo "  bash kube-scripts/talk.sh --fish  # talk to agent"
+echo "  bash kube-scripts/down.sh --fish  # stop agent"
+echo ""
+echo "  (scripts/ is the LEGACY plain-Docker path — no MCP service, no prompt"
+echo "   distributor queue, no observer sidecar. Use kube-scripts/.)"
