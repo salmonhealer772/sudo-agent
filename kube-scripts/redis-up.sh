@@ -195,9 +195,13 @@ spec:
         volumeMounts:
         - name: data
           mountPath: /data
+        # EXEC probe, not tcpSocket: this pod is hostNetwork and Redis is bound
+        # to 127.0.0.1 ONLY, while a kubelet tcpSocket probe dials the pod IP
+        # (the NODE IP) — which refuses, leaving the pod permanently NotReady.
+        # The exec probe runs inside the container's netns, so 127.0.0.1 works.
         readinessProbe:
-          tcpSocket:
-            port: $PORT
+          exec:
+            command: ["redis-cli", "-h", "127.0.0.1", "-p", "$PORT", "ping"]
           initialDelaySeconds: 2
           periodSeconds: 5
       volumes:
