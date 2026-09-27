@@ -29,27 +29,44 @@ Tool surface:
                        FastMCP session id, or "default").
 
     hermes_queue_status()
-        Pending queue + recent processed results (ids, sources, timestamps)
-        — the operator's observability window into the distributor.
+        In-flight + pending queue + recent processed results (ids, sources,
+        timestamps) — the operator's observability window into the distributor.
 
-ORDERING RULES (implemented verbatim, see OBSERVABILITY.md):
+ORDERING RULES (implemented verbatim, see DESIGN.md / OBSERVABILITY.md):
     a. first message in = processed first
     b. then drain ALL remaining messages from that same source before anyone
        else
     c. when empty, move to the NEXT MOST RECENT source and drain it fully
     d. FIFO within a source
 
-Backing store: the SHARED sudo-agent-redis service (REDIS_URL=redis://
-sudo-agent-redis:6379/0, injected by up.sh; PVC-backed, AOF on — the queue
-survives agent pod recreation AND redis pod recreation). If REDIS_URL is
-unset, mcp_entrypoint.sh falls back to a per-pod localhost Redis on
-``REDIS_PORT``. AOF persistence is ON, with the
-documented caveat: the AOF lives on the CONTAINER filesystem (not the PVC),
-so a container restart keeps the queue but a pod RECREATION loses it — that
-is the accepted per-agent failure domain; revisit shared Redis if
-cross-pod durability is ever needed. Queue keys are namespaced under
-``sudo-agent:q:<pod>:*`` so they can never collide with the agent's own
-stores (state.db / watch are separate concerns).
+BACKING STORE — the SHARED sudo-agent-redis (deployed by kube-scripts/redis-up.sh)
+--------------------------------------------------------------------------------
+up.sh injects ``REDIS_URL=redis://127.0.0.1:<port>/0`` into every agent pod, so
+the fleet-wide SHARED Redis is what a deployed agent actually uses. That Redis
+runs ``hostNetwork: true`` and binds the NODE's loopback because every agent pod
+is ``hostNetwork: true`` too and therefore shares the node's network namespace:
+``127.0.0.1`` inside any agent pod IS the node's loopback. This is deliberate —
+it needs no DNS and no Service. A hostNetwork pod with the default dnsPolicy
+gets the NODE resolver, not cluster DNS, so the ClusterIP Service name is NOT
+resolvable from an agent pod; do not point REDIS_URL at a Service name.
+
+Queue namespacing (why two agents cannot steal each other's prompts):
+    One Redis serves the whole fleet, so the key prefix must be unique per
+    agent: ``QUEUE_BASE = sudo-agent:q:<unique-per-agent>``, giving keys like
+    ``sudo-agent:q:<name>:items`` / ``:inflight`` / ``:res:<msg-id>``.
+    The suffix is QUEUE_NAME if set, else AGENT_NAME (injected by up.sh from the
+    agent name, which is unique per deployment because the deployment is
+    ``sudo-<agent>``), else POD_NAME (unique by definition), else MCP_PORT
+    (derived by up.sh from the agent name via cksum, so unique modulo a
+    1-in-24768 hash collision). AGENT_NAME is preferred because it is both
+    readable in redis-cli and collision-proof.
+
+OFFLINE FALLBACK: when REDIS_URL is UNSET, mcp_entrypoint.sh starts a per-pod
+``redis-server`` on ``REDIS_PORT`` — and that port is derived per agent there
+(never 6379/6380), because with hostNetwork even "localhost" ports are
+node-global. The fallback is for offline/degraded operation only; the PVC it
+writes to is ``/opt/data/redis``, so it survives container restarts and pod
+recreation for as long as the PVC exists. Results carry a 7-day TTL.
 
 Flag mapping (== hermes-p.py's functional surface, nothing more, nothing less):
     prompt -> hermes-p.py positional prompt
@@ -85,24 +102,30 @@ DEFAULT_PORT = 8000
 # ---------------------------------------------------------------------------
 # Queue / Redis wiring
 # ---------------------------------------------------------------------------
-# Per-pod Redis on localhost, started by mcp_entrypoint.sh on REDIS_PORT
-# (unique per agent — every sudo-agent pod runs hostNetwork:true, so all pods
-# share the node's network namespace and a fixed port would collide; Redis
-# binds 127.0.0.1 only). REDIS_URL overrides everything (e.g. to point at a
-# shared Redis someday).
-REDIS_URL = os.environ.get(
-    "REDIS_URL",
-    "redis://127.0.0.1:%s/0" % os.environ.get("REDIS_PORT", "6379"),
+# SHARED Redis is the deployed default: up.sh always injects REDIS_URL pointing
+# at the fleet-wide sudo-agent-redis on the node loopback. The per-pod
+# localhost Redis (started by mcp_entrypoint.sh, unique port per agent) is the
+# OFFLINE FALLBACK, used only when REDIS_URL is unset. The literal 40000 here
+# is a last-resort default for a bare `python mcp_server.py` run outside a pod;
+# mcp_entrypoint.sh always exports REDIS_PORT explicitly.
+REDIS_URL = os.environ.get("REDIS_URL") or (
+    "redis://127.0.0.1:%s/0" % os.environ.get("REDIS_PORT", "40000")
 )
 
-# Per-agent namespace. POD_NAME is used when present (clearer in redis) — k3s
-# does not inject it by default, hence the MCP_PORT fallback (also unique per
-# agent because up.sh derives it from the agent name).
+# Per-agent namespace. AGENT_NAME is injected by up.sh (the agent name — unique
+# per deployment); POD_NAME is unique by definition; MCP_PORT is the last
+# resort (also derived from the agent name by up.sh).
 QUEUE_BASE = os.environ.get(
     "QUEUE_NAME",
-    "sudo-agent:q:" + (os.environ.get("POD_NAME") or os.environ.get("MCP_PORT", "8000")),
+    "sudo-agent:q:"
+    + (
+        os.environ.get("AGENT_NAME")
+        or os.environ.get("POD_NAME")
+        or os.environ.get("MCP_PORT", "8000")
+    ),
 )
 ITEMS_KEY = QUEUE_BASE + ":items"
+INFLIGHT_KEY = QUEUE_BASE + ":inflight"
 
 
 def _res_key(msg_id):
@@ -185,6 +208,57 @@ def _pick_next(items, last_source):
     return items[0]
 
 
+def _claim_next(r, last_source, attempts=50):
+    """Atomically CLAIM the next item to run, or return None if the queue is empty.
+
+    This is the exactly-one-at-a-time guarantee. It replaces the old
+    lrange-pick-run-then-lrem sequence, which had two real defects:
+      (a) the item stayed VISIBLE in the pending list while it ran, so
+          hermes_queue_status misreported pending work and a restart re-ran it;
+      (b) the removal happened AFTER the run, so two consumers (or a consumer
+          plus an enqueue-time scan) could act on the same item.
+    Here the read-pick-remove happens inside ONE Redis transaction (WATCH/MULTI):
+    the item is removed from the pending list and pushed onto the in-flight list
+    atomically, and the transaction is aborted and retried if anything touched
+    the pending list in between. Because message ids are unique (msg-<12hex>),
+    the serialized value used by LREM is exact — it can never match a different
+    item. The ordering rule itself (_pick_next) is unchanged.
+    """
+    for _ in range(attempts):
+        try:
+            with r.pipeline() as pipe:
+                pipe.watch(ITEMS_KEY)
+                raw_items = pipe.lrange(ITEMS_KEY, 0, -1)
+                item = _pick_next([_json.loads(x) for x in raw_items], last_source)
+                if item is None:
+                    pipe.unwatch()
+                    return None
+                raw = _json.dumps(item)
+                pipe.multi()
+                pipe.lrem(ITEMS_KEY, 1, raw)   # atomic claim: leave pending...
+                pipe.rpush(INFLIGHT_KEY, raw)  # ...and become visible as in-flight
+                pipe.execute()
+                return item
+        except redis.WatchError:
+            # Something enqueued while we were reading: re-read and re-decide.
+            time.sleep(0.02)
+    return None
+
+
+def _recover_inflight(r, limit=1000):
+    """Requeue items abandoned in the in-flight list by a crashed worker.
+
+    A claim is only released by the worker that took it, so a hard crash can
+    leave an item parked in INFLIGHT with no owner. On (re)connect we move any
+    such items back to the FRONT of the pending list, order preserved, so a
+    restart re-runs at-least-once instead of silently dropping the prompt.
+    """
+    recovered = 0
+    while recovered < limit and r.lmove(INFLIGHT_KEY, ITEMS_KEY, "RIGHT", "LEFT") is not None:
+        recovered += 1
+    return recovered
+
+
 def _store_result(r, item, ok, output, error, started_at, finished_at):
     record = {
         "id": item["id"],
@@ -207,11 +281,9 @@ def _drain_worker():
     while True:
         try:
             r = _redis_client()
+            _recover_inflight(r)
             while True:
-                item = None
-                raw_items = r.lrange(ITEMS_KEY, 0, -1)
-                items = [_json.loads(x) for x in raw_items]
-                item = _pick_next(items, last_source)
+                item = _claim_next(r, last_source)
                 if item is None:
                     time.sleep(0.25)
                     continue
@@ -219,7 +291,7 @@ def _drain_worker():
                 ok, output, error = _execute_prompt(item["prompt"], item["json"])
                 finished_at = time.time()
                 _store_result(r, item, ok, output, error, started_at, finished_at)
-                r.lrem(ITEMS_KEY, 1, _json.dumps(item))
+                r.lrem(INFLIGHT_KEY, 1, _json.dumps(item))
                 last_source = item["source"]
         except Exception:
             # Redis hiccup / restart: back off, then reconnect and keep going.
@@ -251,9 +323,10 @@ def hermes_prompt(
 ) -> str:
     """Send a prompt to THIS sudo-agent agent through the prompt distributor.
 
-    The prompt is enqueued in Redis and fed to the agent by a single drain
-    worker — at most ONE prompt runs against the agent at any moment; extra
-    prompts are held in the queue (never dropped, never concurrent).
+    The prompt is enqueued in the SHARED fleet Redis and fed to the agent by a
+    single in-pod drain worker — at most ONE prompt runs against the agent at
+    any moment (the claim is atomic in Redis, not a Python timing assumption);
+    extra prompts are held in the queue, never dropped, never concurrent.
 
     Args:
         prompt: The message to send.
@@ -292,15 +365,18 @@ def hermes_prompt(
 
 @mcp.tool()
 def hermes_queue_status() -> str:
-    """Return the pending prompt queue and the most recent processed results.
+    """Return the in-flight + pending prompt queue and the recent results.
 
     Each result carries: id, source, ok, started_at, finished_at, error
-    (output elided to 200 chars to keep the payload small). Use this to watch
-    the one-at-a-time / group-by-source drain order, and to fetch inbox-mode
-    replies by message id.
+    (output elided to 200 chars to keep the payload small). The "inflight" list
+    holds the single item currently being run (claimed atomically), so a queue
+    that looks busy with zero pending items is a run in progress, not a leak.
+    Use this to watch the one-at-a-time / group-by-source drain order, and to
+    fetch inbox-mode replies by message id.
     """
     r = _redis_client()
     items = _load_items(r)
+    inflight = [_json.loads(x) for x in r.lrange(INFLIGHT_KEY, 0, -1)]
     results = []
     for key in r.scan_iter(_res_key("*")):
         raw = r.get(key)
@@ -315,7 +391,15 @@ def hermes_queue_status() -> str:
         trimmed.append(rec)
     return _json.dumps(
         {
-            "queue": {"key": QUEUE_BASE, "pending": [{"id": it["id"], "source": it["source"]} for it in items]},
+            "queue": {
+                "key": QUEUE_BASE,
+                "redis_url": REDIS_URL,
+                "inflight": [
+                    {"id": it["id"], "source": it["source"], "enqueued_at": it["enqueued_at"]}
+                    for it in inflight
+                ],
+                "pending": [{"id": it["id"], "source": it["source"]} for it in items],
+            },
             "results": trimmed,
         },
         indent=2,
@@ -326,8 +410,9 @@ def main():
     port = int(os.environ.get("MCP_PORT", str(DEFAULT_PORT)))
 
     # Redis sanity check: fail FAST and LOUD at startup, not on first prompt.
-    # (Bounded retry: mcp_entrypoint.sh starts Redis moments before us, so a
-    # slow Redis start can race the first ping — give it 30s before fatal.)
+    # (Bounded retry: the shared Redis may still be starting, or
+    # mcp_entrypoint.sh may be starting the local fallback moments before us —
+    # give it 30s before fatal.)
     deadline = time.time() + 30
     while True:
         try:
@@ -336,8 +421,11 @@ def main():
         except Exception as exc:
             if time.time() > deadline:
                 raise SystemExit(
-                    f"[mcp_server] FATAL: cannot reach Redis at {REDIS_URL} ({exc}). "
-                    "The prompt distributor requires it — is sudo-agent-redis running? See kube-scripts/redis-up.sh."
+                    f"[mcp_server] FATAL: cannot reach the prompt-distributor Redis at "
+                    f"{REDIS_URL} ({exc}). The queue backing must exist before the agent "
+                    "can be prompted. Deploy/repair it with: bash kube-scripts/redis-up.sh "
+                    "(shared sudo-agent-redis, reached on the node loopback — a hostNetwork "
+                    "pod has NO cluster DNS, so a Service name will never resolve)."
                 )
             time.sleep(1.0)
 
