@@ -41,6 +41,15 @@ PER_AGENT_CONFIG="$CONFIG_DIR/$NAME.yaml"
 # (targetPort) to this unique per-agent port.
 MCP_PORT=$(( 8000 + $(printf '%s' "$NAME" | cksum | cut -d' ' -f1) % 24768 ))
 
+# Per-agent WATCH (observer sidecar) port — same hostNetwork collision rules
+# as MCP_PORT, but hashed from a DIFFERENT string ("$NAME-watch") so it never
+# collides with the MCP port. Guard bumps by 1 in the (astronomically rare) case
+# the two hashes land on the same port.
+WATCH_PORT=$(( 8000 + $(printf '%s-watch' "$NAME" | cksum | cut -d' ' -f1) % 24768 ))
+if [[ "$WATCH_PORT" == "$MCP_PORT" ]]; then
+  WATCH_PORT=$(( MCP_PORT + 1 ))
+fi
+
 # If repo is root-owned and we're not root, bail early
 if [[ ! -w "$REPO_DIR" ]] && [[ "$(id -u)" != "0" ]]; then
   echo "Repo is root-owned. Run with: sudo bash kube-scripts/up.sh --$NAME" >&2
@@ -102,6 +111,13 @@ if [[ -z "$SUDO_PASS" ]]; then
   echo "→ Generated sudo password: $SUDO_PASS"
 fi
 
+# ── Observer sidecar daemon script (shipped via the ConfigMap below) ──
+WATCH_SIDECAR="$SCRIPT_DIR/watch_sidecar.py"
+if [[ ! -f "$WATCH_SIDECAR" ]]; then
+  echo "✗ Missing $WATCH_SIDECAR (observer sidecar daemon)" >&2
+  exit 1
+fi
+
 # ── Generate YAML ──
 echo "→ Writing $YAML..."
 cat > "$YAML" <<YAMLEOF
@@ -138,6 +154,7 @@ spec:
         app: sudo-agent
         agent: $NAME
     spec:
+      shareProcessNamespace: true
       hostNetwork: true
       containers:
       - name: sudo-agent
@@ -162,6 +179,32 @@ spec:
           mountPath: /opt/data/config.yaml
         - name: docker-sock
           mountPath: /var/run/docker.sock
+      # ── Observer sidecar container ────────────────────────────────────────
+      # Monitors the agent container (shared PID namespace), captures every
+      # message from the Hermes SQLite store into <PVC>/watch/events.jsonl,
+      # distills <PVC>/watch/transcript.txt, and serves the HTTP tap on
+      # WATCH_PORT. Same image (explicit command — the hermes image has no
+      # CMD); no docker socket; runs as uid 10000 so the watch dir on the
+      # PVC is owned by the agent uid.
+      - name: watch
+        image: sudo-agent:latest
+        imagePullPolicy: IfNotPresent
+        command: ["python3", "/opt/watch-sidecar/watch_sidecar.py"]
+        securityContext:
+          runAsUser: 10000
+          runAsNonRoot: true
+        env:
+        - name: WATCH_PORT
+          value: "$WATCH_PORT"
+        - name: AGENT_NAME
+          value: "$NAME"
+        - name: DEPLOY_NAME
+          value: "$DEPLOY"
+        volumeMounts:
+        - name: data
+          mountPath: /opt/data
+        - name: watch-config
+          mountPath: /opt/watch-sidecar
       volumes:
       - name: data
         persistentVolumeClaim:
@@ -174,6 +217,35 @@ spec:
         hostPath:
           path: /var/run/docker.sock
           type: Socket
+      - name: watch-config
+        configMap:
+          name: $DEPLOY-watch-config
+          defaultMode: 0755
+---
+# ── Observer sidecar (watch) ──────────────────────────────────────────────
+# ConfigMap consumed by the watch container: the daemon script (mounted
+# executable at /opt/watch-sidecar/) + its config.json (log_dir, poll
+# interval, port, noisy_sources for the reminder flag).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: $DEPLOY-watch-config
+  labels:
+    app: sudo-agent
+    agent: $NAME
+data:
+  watch_sidecar.py: |
+$(sed 's/^/    /' "$WATCH_SIDECAR")
+  config.json: |
+    {
+      "agent_name": "$NAME",
+      "deploy_name": "$DEPLOY",
+      "watch_port": $WATCH_PORT,
+      "poll_interval_sec": 2,
+      "log_dir": "/opt/data/watch",
+      "db_path": "/opt/data/state.db",
+      "noisy_sources": ["cron", "subagent"]
+    }
 ---
 apiVersion: v1
 kind: Service
@@ -191,6 +263,26 @@ spec:
   - name: mcp
     port: 8000
     targetPort: $MCP_PORT
+---
+# Observer sidecar Service: stable port 8000 -> per-agent WATCH_PORT
+# (hostNetwork pods share the node's network namespace, so the sidecar itself
+# listens on a unique per-agent port; the Service gives it a stable name).
+apiVersion: v1
+kind: Service
+metadata:
+  name: $DEPLOY-watch
+  labels:
+    app: sudo-agent
+    agent: $NAME
+spec:
+  type: ClusterIP
+  selector:
+    app: sudo-agent
+    agent: $NAME
+  ports:
+  - name: watch
+    port: 8000
+    targetPort: $WATCH_PORT
 YAMLEOF
 
 if [[ ! -s "$YAML" ]]; then
@@ -226,5 +318,7 @@ echo "✓ $DEPLOY deployed"
 echo "  Talk:   kubectl exec -it deploy/$DEPLOY -- hermes"
 echo "  Shell:  kubectl exec -it deploy/$DEPLOY -- bash"
 echo "  MCP:    http://$DEPLOY-mcp:8000/mcp"
+echo "  Watch:  http://$DEPLOY-watch:8000/status  (also /ps /events /stream /healthz)"
+echo "  Stream: bash kube-scripts/stream.sh --$NAME  (-t for transcript)"
 echo "  Logs:   kubectl logs deploy/$DEPLOY -f"
 echo "  Stop:   bash kube-scripts/down.sh --$NAME"
