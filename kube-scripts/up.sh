@@ -80,6 +80,31 @@ fi
 
 echo "→ sudo-$NAME starting up..."
 
+# ── Shared queue Redis (the prompt distributor's backing store) ──────────────
+# up.sh OWNS this wiring: it provisions the shared Redis BEFORE the agent pod
+# exists, so the MCP server's startup fail-fast ping can succeed on first boot,
+# and injects the REDIS_URL that matches it. Failure ABORTS the deploy — a pod
+# booted without its queue backing has a dead prompt path, which is exactly the
+# silent breakage this design exists to prevent. Deliberately NO `|| true`, no
+# `2>/dev/null`, no `| tail`: a broken queue must never look like a good deploy.
+#
+# Port 6380, not 6379: the redis Deployment runs hostNetwork:true and binds the
+# node's loopback (the only path an agent pod can reach — hostNetwork pods get
+# the NODE resolver, not cluster DNS, so a Service name never resolves), which
+# makes the port NODE-GLOBAL. sudo-letta-redis already owns node 6379.
+# redis-up.sh refuses to bind a port it does not own, loudly.
+SHARED_REDIS_PORT="${SUDO_AGENT_REDIS_PORT:-6380}"
+REDIS_URL="redis://127.0.0.1:${SHARED_REDIS_PORT}/0"
+export SUDO_AGENT_REDIS_PORT="$SHARED_REDIS_PORT"
+
+echo "→ Provisioning shared queue Redis (kube-scripts/redis-up.sh, node port $SHARED_REDIS_PORT)..."
+if ! bash "$SCRIPT_DIR/redis-up.sh"; then
+  echo "✗ FAILED to provision the shared Redis (kube-scripts/redis-up.sh)." >&2
+  echo "  Deploy aborted: without it the pod's prompt-distributor queue is dead on arrival." >&2
+  exit 1
+fi
+echo "→ Shared queue Redis ready: sudo-agent-redis at $REDIS_URL (hostNetwork, node loopback)"
+
 # ── API Key ──
 _read_key() {
   grep '^DEEPSEEK_API_KEY=' "$1" 2>/dev/null | cut -d'=' -f2- | head -1
@@ -172,8 +197,18 @@ spec:
           value: "true"
         - name: MCP_PORT
           value: "$MCP_PORT"
+        # Queue namespace for THIS agent's prompt queue in the SHARED Redis.
+        # One Redis serves the whole fleet, so the prefix must be unique per
+        # agent or two agents would steal each other's prompts.
+        - name: AGENT_NAME
+          value: "$NAME"
+        # The SHARED prompt-distributor Redis, reached on the NODE loopback
+        # (mcp_entrypoint.sh starts a per-pod local Redis only when this is
+        # unset — the offline fallback). NOT a Service name: a hostNetwork pod
+        # gets the node resolver, not cluster DNS, so a Service name cannot
+        # resolve. See kube-scripts/redis-up.sh.
         - name: REDIS_URL
-          value: redis://sudo-agent-redis:6379/0
+          value: $REDIS_URL
         volumeMounts:
         - name: data
           mountPath: /opt/data
@@ -292,19 +327,78 @@ if [[ ! -s "$YAML" ]]; then
 fi
 echo "→ YAML written: $YAML"
 
-# ── Import images into containerd (best-effort, don't die) ──
+# ── Import images into containerd ─────────────────────────────────────────────
+# The pod runs `sudo-agent:latest` with imagePullPolicy: IfNotPresent, so if the
+# import silently fails, the pod keeps running whatever STALE copy containerd
+# already had — a deploy that lies about what it shipped. This repo has paid for
+# that trap once already (a hermes-agent:latest older than the queue work), so
+# the agent image is now verified AFTER import and its absence is FATAL.
+_ctr_images() {
+  sudo k3s ctr images ls -q 2>/dev/null || sudo ctr -n k8s.io images ls -q 2>/dev/null || true
+}
+
+_image_present() {
+  local img="$1" refs
+  refs="$(_ctr_images)"
+  grep -Fxq "$img" <<<"$refs" && return 0
+  grep -Fxq "docker.io/library/$img" <<<"$refs" && return 0
+  return 1
+}
+
 _import_image() {
   local img="$1"
-  if docker save "$img" 2>/dev/null | sudo k3s ctr image import - 2>/dev/null; then
+  if ! docker image inspect "$img" >/dev/null 2>&1; then
+    echo "✗ FATAL: docker image $img does not exist locally — nothing to import." >&2
+    echo "  Build it first:  bash setup.sh   (or: docker build -t $img -f \"$REPO_DIR/Dockerfile\" \"$REPO_DIR\")" >&2
+    exit 1
+  fi
+  if docker save "$img" | sudo k3s ctr image import - ; then
     echo "→ $img imported via k3s ctr"
-  elif docker save "$img" 2>/dev/null | sudo ctr -n k8s.io image import - 2>/dev/null; then
+  elif docker save "$img" | sudo ctr -n k8s.io image import - ; then
     echo "→ $img imported via ctr"
   else
-    echo "⚠ Could not import $img — it might already be present"
+    echo "⚠ both import paths reported failure for $img — verifying containerd..." >&2
+  fi
+  if ! _image_present "$img"; then
+    echo "✗ FATAL: $img is NOT in containerd after import." >&2
+    echo "  The pod would keep running a stale copy (imagePullPolicy: IfNotPresent). Deploy aborted." >&2
+    exit 1
+  fi
+  echo "→ $img present in containerd"
+}
+
+# The image the pods RUN must be newer than the sources baked into it, or the
+# deploy ships a pod without the code you just changed. Loud, with an override.
+_assert_image_fresh() {
+  local img="sudo-agent:latest" created created_epoch=0 newest=0 f m
+  created="$(docker image inspect "$img" --format '{{.Created}}' 2>/dev/null)" || {
+    echo "✗ FATAL: docker image $img not found locally. Build it first:" >&2
+    echo "    docker build -t $img -f \"$REPO_DIR/Dockerfile\" \"$REPO_DIR\"   (or bash setup.sh)" >&2
+    exit 1
+  }
+  created_epoch="$(date -d "$created" +%s 2>/dev/null || echo 0)"
+  for f in "$REPO_DIR/Dockerfile" "$REPO_DIR/patch_memory_review.py" \
+           "$SCRIPT_DIR/hermes_prompt.py" "$SCRIPT_DIR/mcp_server.py" \
+           "$SCRIPT_DIR/mcp_entrypoint.sh"; do
+    [[ -f "$f" ]] || continue
+    m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+    if (( m > newest )); then newest=$m; fi
+  done
+  if (( created_epoch < newest )); then
+    if [[ "${SUDO_AGENT_ALLOW_STALE_IMAGE:-}" == "1" ]]; then
+      echo "⚠ $img is OLDER than its source files — proceeding only because SUDO_AGENT_ALLOW_STALE_IMAGE=1" >&2
+    else
+      echo "✗ FATAL: $img was built $(date -d @"$created_epoch" '+%Y-%m-%d %H:%M:%S') but its sources changed $(date -d @"$newest" '+%Y-%m-%d %H:%M:%S')." >&2
+      echo "  The pod would run WITHOUT your latest code (imagePullPolicy: IfNotPresent)." >&2
+      echo "  Rebuild:  docker build -t $img -f \"$REPO_DIR/Dockerfile\" \"$REPO_DIR\"" >&2
+      echo "  Override: SUDO_AGENT_ALLOW_STALE_IMAGE=1 bash kube-scripts/up.sh --$NAME" >&2
+      exit 1
+    fi
   fi
 }
 
 echo "→ Importing images..."
+_assert_image_fresh
 _import_image hermes-agent:latest
 _import_image sudo-agent:latest
 
@@ -317,6 +411,7 @@ fi
 
 echo ""
 echo "✓ $DEPLOY deployed"
+echo "  Queue:  $REDIS_URL via shared sudo-agent-redis (one drain worker per pod)"
 echo "  Talk:   kubectl exec -it deploy/$DEPLOY -- hermes"
 echo "  Shell:  kubectl exec -it deploy/$DEPLOY -- bash"
 echo "  MCP:    http://$DEPLOY-mcp:8000/mcp"
