@@ -112,3 +112,13 @@ same functionality and nothing more. It is fronted by a Kubernetes Service named
 ## Why not eliza-gbrain-docker?
 
 Because that repo is a design doc. This one is real software.
+
+### Queue backing (shared Redis)
+The prompt-distributor queue in every agent pod points at the shared
+`sudo-agent-redis` service (deploy once with `bash kube-scripts/redis-up.sh`:
+Deployment + ClusterIP Service on 6379 + its own 2Gi PVC, AOF on,
+appendfsync everysec — deliberately separate from sudo-letta-redis). The
+queue therefore survives agent pod recreation AND redis pod recreation; the
+old "pod recreation loses the queue" caveat is fixed by this design. The
+per-pod localhost Redis remains as an offline fallback when `REDIS_URL` is
+unset.

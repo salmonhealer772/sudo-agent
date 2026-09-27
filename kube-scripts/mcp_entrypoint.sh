@@ -8,8 +8,9 @@
 # gateway WITHOUT replacing it.
 #
 # This script is the image ENTRYPOINT. It:
-#   1. starts the per-pod Redis (the prompt distributor's backing store;
-#      localhost-only, unique REDIS_PORT, AOF on) in the background;
+#   1. NO-OP when REDIS_URL (shared sudo-agent-redis service) is set — the
+#      distributor uses the shared Redis. Only when REDIS_URL is UNSET does it
+#      start a per-pod localhost Redis (offline fallback, AOF on) here;
 #   2. starts the MCP server (the FastMCP streamable-HTTP wrapper over
 #      hermes-p) in the background, in a restart loop so a crash doesn't take
 #      the endpoint down permanently;
@@ -36,33 +37,37 @@ set -u
 PORT="${MCP_PORT:-8000}"
 RPORT="${REDIS_PORT:-6379}"
 
-mkdir -p /opt/data/redis 2>/dev/null || true
+# Redis backing for the prompt distributor: by default the SHARED
+# sudo-agent-redis service (REDIS_URL injected by up.sh; deployed by
+# kube-scripts/redis-up.sh, PVC-backed, AOF on). Local per-pod Redis is only
+# an OFFLINE FALLBACK when REDIS_URL is unset: bound to 127.0.0.1 ONLY (pods
+# run hostNetwork:true, so binding anything else would expose the queue to
+# every pod on the node), AOF ON, run as hermes (uid 10000) so the AOF files
+# on the PVC are owned by the agent uid, in a restart loop so a Redis crash
+# cannot take the distributor down permanently.
+if [ -z "${REDIS_URL:-}" ]; then
+  mkdir -p /opt/data/redis 2>/dev/null || true
+  (
+    while :; do
+      HOME=/opt/data /command/s6-setuidgid hermes \
+        redis-server \
+          --port "$RPORT" \
+          --bind 127.0.0.1 \
+          --protected-mode yes \
+          --appendonly yes \
+          --appendfsync everysec \
+          --dir /opt/data/redis \
+          --dbfilename dump.rdb \
+          --logfile /opt/data/redis/redis.log \
+          --daemonize no || true
+      sleep 2
+    done
+  ) &
+fi
 
-# Per-pod Redis for the prompt distributor. Bound to 127.0.0.1 ONLY (pods run
-# hostNetwork:true, so binding anything else would expose the queue to every
-# pod on the node). AOF persistence ON. Runs as hermes (uid 10000) so the AOF
-# files on the PVC are owned by the agent uid. Also run in a restart loop so a
-# Redis crash cannot take the distributor down permanently.
 (
   while :; do
-    HOME=/opt/data /command/s6-setuidgid hermes \
-      redis-server \
-        --port "$RPORT" \
-        --bind 127.0.0.1 \
-        --protected-mode yes \
-        --appendonly yes \
-        --appendfsync everysec \
-        --dir /opt/data/redis \
-        --dbfilename dump.rdb \
-        --logfile /opt/data/redis/redis.log \
-        --daemonize no || true
-    sleep 2
-  done
-) &
-
-(
-  while :; do
-    HOME=/opt/data HERMES_HOME=/opt/data MCP_PORT="$PORT" REDIS_PORT="$RPORT" \
+    HOME=/opt/data HERMES_HOME=/opt/data MCP_PORT="$PORT" REDIS_PORT="$RPORT" REDIS_URL="${REDIS_URL:-}" \
       /command/s6-setuidgid hermes \
       /opt/hermes/.venv/bin/python /opt/hermes-mcp/mcp_server.py || true
     sleep 2

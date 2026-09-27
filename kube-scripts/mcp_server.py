@@ -39,8 +39,11 @@ ORDERING RULES (implemented verbatim, see OBSERVABILITY.md):
     c. when empty, move to the NEXT MOST RECENT source and drain it fully
     d. FIFO within a source
 
-Backing store: PER-POD Redis on localhost (started by mcp_entrypoint.sh on
-``REDIS_PORT``; ``REDIS_URL`` overrides). AOF persistence is ON, with the
+Backing store: the SHARED sudo-agent-redis service (REDIS_URL=redis://
+sudo-agent-redis:6379/0, injected by up.sh; PVC-backed, AOF on — the queue
+survives agent pod recreation AND redis pod recreation). If REDIS_URL is
+unset, mcp_entrypoint.sh falls back to a per-pod localhost Redis on
+``REDIS_PORT``. AOF persistence is ON, with the
 documented caveat: the AOF lives on the CONTAINER filesystem (not the PVC),
 so a container restart keeps the queue but a pod RECREATION loses it — that
 is the accepted per-agent failure domain; revisit shared Redis if
@@ -334,7 +337,7 @@ def main():
             if time.time() > deadline:
                 raise SystemExit(
                     f"[mcp_server] FATAL: cannot reach Redis at {REDIS_URL} ({exc}). "
-                    "The prompt distributor requires it — see kube-scripts/mcp_entrypoint.sh."
+                    "The prompt distributor requires it — is sudo-agent-redis running? See kube-scripts/redis-up.sh."
                 )
             time.sleep(1.0)
 

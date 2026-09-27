@@ -113,7 +113,7 @@ prompt distributor. `hermes_prompt` on the per-pod MCP NO LONGER spawns
 single drain worker feeds the agent ONE prompt at a time (never concurrent,
 never dropped).
 
-- **Backing store**: per-pod Redis on 127.0.0.1, unique `REDIS_PORT` per
+- **Backing store**: shared sudo-agent-redis on 127.0.0.1, unique `REDIS_PORT` per
   agent (same cksum-hash scheme as MCP_PORT/WATCH_PORT, hashed from
   `<name>-redis`). AOF ON, data dir `/opt/data/redis/` on the agent PVC.
 - **Durability caveat**: the AOF lives on the agent PVC, so container
@@ -154,3 +154,11 @@ id) are the authoritative one-at-a-time evidence — see the `results` array of
   command (`hermes` image has no CMD) — the daemon script ships via the
   `sudo-<name>-watch-config` ConfigMap.
 - Daemon: `kube-scripts/watch_sidecar.py` — stdlib only.
+
+
+## Queue backing (shared Redis)
+The prompt-distributor queue is backed by the shared `sudo-agent-redis`
+service (`REDIS_URL=redis://sudo-agent-redis:6379/0`), deployed by
+`kube-scripts/redis-up.sh` with its own PVC and AOF persistence on — the
+queue survives agent pod recreation AND redis pod recreation. Per-pod
+localhost Redis remains as an offline fallback when `REDIS_URL` is unset.
