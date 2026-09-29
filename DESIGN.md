@@ -25,7 +25,9 @@ One command. Hermes Agent on DeepSeek — contained in Docker. Multiple agents b
 | `redis-up.sh` | Deploy/refresh the shared queue Redis (`sudo-agent-redis`) | Idempotent, loud on failure, run by `up.sh` and `setup.sh` |
 | `rm-containers.sh --name` | Force-remove one deployment | — |
 | `rm-containers.sh --ALL` | Force-remove **all** `sudo-*` deployments | Nuke button |
-| `stream.sh --name [-t]` | Live agent events / distilled transcript | Reads the observer sidecar's HTTP tap |
+| `stream.sh --name [-t]` | Live TOKEN stream (default), or the distilled transcript | `--thinking` / `--answer` / `--context` filters, `--events` for the old tape |
+| `watch_plugin/` | Hermes plugin: token-level stream tap | stdlib only; shipped via `sudo-<name>-watch-plugin` ConfigMap |
+| `watch_plugin_enable.py` | Enables the plugin in a per-agent config | Surgical text edit + re-parse; called by `up.sh` |
 | `hermes-p.py` | Host-side one-shot prompt CLI | `--list`, name resolution, `--json` |
 | `mcp_server.py` / `mcp_entrypoint.sh` | Per-pod MCP server + supervisor | Baked into the image |
 | `watch_sidecar.py` | Observer daemon (events/transcript/HTTP tap) | Ships via ConfigMap |
@@ -87,6 +89,65 @@ namespace. Three consequences are load-bearing:
    loudly if anything other than this deployment's own Redis holds it, rather
    than crashlooping. If the two fleets are ever to share one port, the Letta
    fleet is the one that must move — see the header of `kube-scripts/redis-up.sh`.
+
+## Design rule: token-level observability (read before touching the watch surface)
+
+The observer sidecar can only report what the agent has **finished**: it polls
+`/opt/data/state.db`, and Hermes writes a `messages` row only when a message is
+COMPLETE. No partial row exists while the model streams, so "every word the
+agent thinks, in real time" is impossible from the DB by construction — not a
+matter of polling faster.
+
+1. **The tap is a Hermes plugin, not a poller.** `kube-scripts/watch_plugin/`
+   registers callbacks on Hermes' native stream hooks
+   (`on_stream_start` / `on_stream_delta` / `on_stream_end` /
+   `pre_api_request` / `post_api_request`) and appends to
+   `<HERMES_HOME>/watch/stream.jsonl`. Deltas are true per-token chunks
+   (`kind: text|reasoning`), and `pre_api_request` hands over the full
+   sanitised request body — the exact context the model is about to think
+   against — on every API call.
+2. **Discovery and enablement are pinned.** A `standalone` plugin loads only
+   when its key is in `plugins.enabled`; reasoning deltas only flow with
+   `plugins.stream_reasoning_deltas: true`. `up.sh` therefore (a) ships the
+   plugin as `sudo-<name>-watch-plugin` mounted read-only at
+   `/opt/data/plugins/sudo-watch-stream/` — the user-plugin dir for
+   `HERMES_HOME=/opt/data` — in BOTH containers, and (b) edits
+   `config/<name>.yaml` with `watch_plugin_enable.py`. That helper is a
+   surgical TEXT edit (operator comments and unrelated settings survive) whose
+   result is re-parsed with a real YAML parser before it replaces the file;
+   it refuses to touch a config that does not parse.
+3. **In-band callbacks must never hurt the agent.**
+   `pre_api_request` fires inline on the request path, so its callback only
+   builds a small dict of references and queue-puts it: truncation, JSON
+   encoding and file I/O all happen on a daemon writer thread. The queue is
+   bounded (20000) and **drops the oldest** rather than blocking, and every
+   callback is wrapped in try/except. Hermes itself dispatches
+   `on_stream_delta` on a per-consumer thread with a 1024-deep queue, so a
+   slow sink throttles the hook — which is exactly why the writer must be
+   fast and must never raise.
+4. **The deploy proves itself or fails.** After `kubectl apply`, `up.sh` waits
+   for the rollout and then, inside the pod, asks Hermes' own plugin manager
+   how many callbacks are registered for `on_stream_delta` and
+   `pre_api_request`. Zero callbacks aborts the deploy loudly. A pod that
+   silently ships no token stream is the failure mode this rule exists to
+   prevent. (`SUDO_AGENT_SKIP_STREAM_PROBE=1` is the documented,
+   discouraged escape hatch.)
+5. **Rejected alternative: an on-wire SSE tap.** Tracing the provider
+   connection would also give true token rate, but the watch container has NO
+   effective capabilities (`CapEff: 0000000000000000`) so it cannot ptrace at
+   all, and a tracer inside the agent container would couple the observer to
+   the runtime. The plugin keeps the observer's core property — it only reads
+   the agent, never changes it.
+6. **Non-streaming paths are covered, not ignored.** A turn that never streams
+   (provider refuses SSE, `copilot-acp`, a MoA facade with no consumers) still
+   gets `input_context` and a `completion` event carrying the finished text
+   with `streamed: false`. Nothing is silently absent.
+7. **Additive by construction.** `stream.jsonl` / `plugin.json` and the new
+   `/stream` behaviour sit beside `events.jsonl`, `transcript.txt`, state.db
+   capture, the MCP prompt surface and the Redis queue; the previous events
+   tail is preserved verbatim at `/events-stream`. Agents pick it up on their
+   next `up.sh` roll — the surface is per-agent, so no fleet-wide cutover is
+   needed (and none should be done without operator sign-off).
 
 ## MCP Service
 
