@@ -50,6 +50,15 @@ COPY kube-scripts/mcp_entrypoint.sh /opt/hermes-mcp/mcp_entrypoint.sh
 RUN chmod +x /opt/hermes-mcp/mcp_entrypoint.sh && \
     chown -R hermes:hermes /opt/hermes-mcp
 
+# Comm layer: the 3 native cross-agent tools (list-siblings, message-agent,
+# check-agent) + their skills + persona snippet. The tool backends are baked
+# into the image here (image-level, NOT shadowed by the /opt/data PVC); the
+# skills + persona are staged in the image and seeded into the PVC on first
+# boot by mcp_entrypoint.sh (see the seed block there).
+COPY comm/tools/ /opt/comm-tools/
+COPY comm/skills/ /opt/comm-skills/
+COPY comm/PERSONA-SNIPPET.md /opt/comm/PERSONA-SNIPPET.md
+
 # Copy the memory review patcher and run it
 COPY patch_memory_review.py /tmp/patch_memory_review.py
 RUN python3 /tmp/patch_memory_review.py && rm /tmp/patch_memory_review.py

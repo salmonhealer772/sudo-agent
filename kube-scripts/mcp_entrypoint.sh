@@ -40,6 +40,28 @@
 
 set -u
 
+# Comm layer: seed the fleet comm skills + persona snippet on FIRST boot
+# only. The tools are baked into the image (Dockerfile COPY ->
+# /opt/comm-tools/), but Hermes reads skills from $HERMES_HOME/skills (=
+# /opt/data/skills, the PVC) and its identity from SOUL.md (also the PVC),
+# which start empty on a fresh engineer. A .comm-seeded marker makes this
+# idempotent: restarts skip it, and the agent's later edits to skills/ or
+# SOUL.md are preserved. Safe no-ops when a dir/file is absent.
+if [ ! -f /opt/data/.comm-seeded ]; then
+  mkdir -p /opt/data/skills 2>/dev/null || true
+  if [ -d /opt/comm-skills ]; then
+    cp -a /opt/comm-skills/. /opt/data/skills/ 2>/dev/null || true
+  fi
+  if [ -f /opt/comm/PERSONA-SNIPPET.md ] \
+     && [ -f /opt/data/SOUL.md ] \
+     && ! grep -q "Fleet communication" /opt/data/SOUL.md 2>/dev/null; then
+    printf "\n" >> /opt/data/SOUL.md 2>/dev/null || true
+    cat /opt/comm/PERSONA-SNIPPET.md >> /opt/data/SOUL.md 2>/dev/null || true
+  fi
+  chown -R 10000:10000 /opt/data/skills /opt/data/SOUL.md 2>/dev/null || true
+  touch /opt/data/.comm-seeded 2>/dev/null || true
+fi
+
 PORT="${MCP_PORT:-8000}"
 
 # Offline-fallback Redis port: derived from MCP_PORT so it is unique per agent.
