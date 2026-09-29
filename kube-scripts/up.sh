@@ -470,6 +470,27 @@ _image_present() {
   return 1
 }
 
+# _retry N "description" cmd [args...] — run cmd up to N times with backoff.
+# The import can transiently fail (containerd busy during a concurrent import,
+# a slow disk, a just-started k3s) — retry before declaring it fatal.
+_retry() {
+  local n="$1" desc="$2"; shift 2
+  local i=1
+  while (( i <= n )); do
+    if "$@"; then return 0; fi
+    echo "⚠ ($desc) attempt $i/$n failed — retrying in ${i}s..." >&2
+    sleep "$i"
+    (( i++ ))
+  done
+  return 1
+}
+
+_import_once() {
+  local img="$1"
+  docker save "$img" | k3s ctr image import - \
+    || docker save "$img" | ctr -n k8s.io image import -
+}
+
 _import_image() {
   local img="$1"
   if ! docker image inspect "$img" >/dev/null 2>&1; then
@@ -477,13 +498,8 @@ _import_image() {
     echo "  Build it first:  bash setup.sh   (or: docker build -t $img -f \"$REPO_DIR/Dockerfile\" \"$REPO_DIR\")" >&2
     exit 1
   fi
-  if docker save "$img" | k3s ctr image import - ; then
-    echo "→ $img imported via k3s ctr"
-  elif docker save "$img" | ctr -n k8s.io image import - ; then
-    echo "→ $img imported via ctr"
-  else
-    echo "⚠ both import paths reported failure for $img — verifying containerd..." >&2
-  fi
+  _retry 3 "image import $img" _import_once "$img" \
+    || echo "⚠ all image-import attempts reported failure for $img — verifying containerd..." >&2
   if ! _image_present "$img"; then
     echo "✗ FATAL: $img is NOT in containerd after import." >&2
     echo "  The pod would keep running a stale copy (imagePullPolicy: IfNotPresent). Deploy aborted." >&2
