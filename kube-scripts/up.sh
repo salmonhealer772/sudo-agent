@@ -367,7 +367,7 @@ echo "→ YAML written: $YAML"
 # that trap once already (a hermes-agent:latest older than the queue work), so
 # the agent image is now verified AFTER import and its absence is FATAL.
 _ctr_images() {
-  sudo k3s ctr images ls -q 2>/dev/null || sudo ctr -n k8s.io images ls -q 2>/dev/null || true
+  k3s ctr images ls -q 2>/dev/null || ctr -n k8s.io images ls -q 2>/dev/null || true
 }
 
 _image_present() {
@@ -385,9 +385,9 @@ _import_image() {
     echo "  Build it first:  bash setup.sh   (or: docker build -t $img -f \"$REPO_DIR/Dockerfile\" \"$REPO_DIR\")" >&2
     exit 1
   fi
-  if docker save "$img" | sudo k3s ctr image import - ; then
+  if docker save "$img" | k3s ctr image import - ; then
     echo "→ $img imported via k3s ctr"
-  elif docker save "$img" | sudo ctr -n k8s.io image import - ; then
+  elif docker save "$img" | ctr -n k8s.io image import - ; then
     echo "→ $img imported via ctr"
   else
     echo "⚠ both import paths reported failure for $img — verifying containerd..." >&2
