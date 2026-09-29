@@ -306,6 +306,25 @@ def stamp(ts):
     except Exception:
         return "--:--:--"
 
+# ── control bytes are terminal COMMANDS, not text ──────────────────────────
+# A raw ESC in model output (or in a mirrored agent.log line) is executed by the
+# terminal: \x1b[2A moves the cursor up over what was already printed,
+# \x1b[?25l hides the cursor, \x1b[31m recolours the rest of the screen, \x0d
+# overwrites the current line, \x07 beeps. The tape keeps the byte-for-byte
+# record (JSON escapes control characters anyway) — this is ONLY about the
+# console, where such a byte is rendered as a visible \xNN instead. That keeps
+# full fidelity (nothing truncated, no whitespace collapsed, every character
+# still shown) while making the sequence inert. \t and \n pass through
+# untouched; they are formatting, not control.
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def safe(value):
+    """Return *value* with non-printing control characters made visible."""
+    if not isinstance(value, str) or not _CTRL_RE.search(value):
+        return value
+    return _CTRL_RE.sub(lambda m: "\\x%02x" % ord(m.group(0)), value)
+
 def hk_prefix(ev):
     """Housekeeping marker; remembered for the whole turn so every line of a
     cron/subagent turn is visibly tagged, not just its header."""
@@ -361,9 +380,9 @@ for raw in sys.stdin:
         turn_active = True
         turn_hk = bool(ev.get("housekeeping"))
         out("%s%s\u250c\u2500\u2500 turn %s \u00b7 iter %s \u00b7 %s (%s) \u00b7 surface=%s \u00b7 %s%s\n" % (
-            BOLD + CYAN, "", ev.get("turn_id") or "?", ev.get("iteration"),
-            ev.get("model") or "?", ev.get("provider") or "?",
-            ev.get("surface") or "?", ts, OFF))
+            BOLD + CYAN, "", safe(ev.get("turn_id") or "?"), ev.get("iteration"),
+            safe(ev.get("model") or "?"), safe(ev.get("provider") or "?"),
+            safe(ev.get("surface") or "?"), ts, OFF))
         if turn_hk:
             out("%s\u2502  housekeeping turn (%s) \u2014 recorded AND shown, not suppressed%s\n" % (
                 YELLOW, ev.get("housekeeping_reason") or "?", OFF))
@@ -384,7 +403,7 @@ for raw in sys.stdin:
             um = ev.get("user_message") or ""
             def block(label, text):
                 out("%s\u2502 %s (%d chars):%s\n" % (YELLOW, label, len(text), OFF))
-                out(text if text.endswith("\n") else text + "\n")
+                out(safe(text) if text.endswith("\n") else safe(text) + "\n")
                 out("%s\u2502 ---%s\n" % (YELLOW, OFF))
             if sp:
                 block("system_prompt", sp)
@@ -407,21 +426,23 @@ for raw in sys.stdin:
         if only_answer and dkind != "text":
             continue
         start_run(dkind)
-        # VERBATIM: no truncation, no whitespace collapsing, no re-encoding
-        out(ev.get("delta") or "")
+        # VERBATIM: no truncation, no whitespace collapsing, no re-encoding.
+        # Control bytes are only made inert for the terminal (see safe()) — the
+        # tape still carries the true byte sequence.
+        out(safe(ev.get("delta") or ""))
     elif kind == "tool_call":
         end_run()
         out("%s%s\u251c\u2500 TOOL %s (%s chars of args) \u00b7 %s%s\n" % (
-            hk_prefix(ev), MAGENTA, ev.get("tool") or "?", ev.get("args_chars"), ts, OFF))
-        out(body(ev.get("args")) + "\n")
+            hk_prefix(ev), MAGENTA, safe(ev.get("tool") or "?"), ev.get("args_chars"), ts, OFF))
+        out(safe(body(ev.get("args"))) + "\n")
     elif kind == "tool_result":
         end_run()
         err = ev.get("error_message")
         out("%s%s\u251c\u2500 RESULT %s \u00b7 %s \u00b7 %sms \u00b7 %s chars%s%s\n" % (
-            hk_prefix(ev), MAGENTA, ev.get("tool") or "?",
+            hk_prefix(ev), MAGENTA, safe(ev.get("tool") or "?"),
             ev.get("status") or "?", ev.get("duration_ms"),
             ev.get("result_chars"), (" \u00b7 error=" + str(err)) if err else "", OFF))
-        out(body(ev.get("result")) + "\n")
+        out(safe(body(ev.get("result"))) + "\n")
     elif kind == "activity":
         if not show_activity:
             continue
@@ -441,8 +462,8 @@ for raw in sys.stdin:
         paint = RED if lvl in ("ERROR", "CRITICAL", "FATAL") else (
             YELLOW if lvl in ("WARNING", "WARN") else DIM)
         out("%s\u00b7 %s [%s%s] %s%s\n" % (
-            paint, ts, ev.get("stream") or "log",
-            (" " + lvl) if lvl else "", ev.get("line") or "", OFF))
+            paint, ts, safe(ev.get("stream") or "log"),
+            (" " + safe(lvl)) if lvl else "", safe(ev.get("line") or ""), OFF))
     elif kind == "stream_end":
         end_run()
         err = ev.get("error")
@@ -464,7 +485,7 @@ for raw in sys.stdin:
         if not ev.get("streamed"):
             end_run()
             out("%s%s[non-streamed answer]%s %s\n" % (
-                hk_prefix(ev), YELLOW, OFF, ev.get("text") or ""))
+                hk_prefix(ev), YELLOW, OFF, safe(ev.get("text") or "")))
     elif kind == "plugin_state":
         out("%s[plugin] %s loaded=%s hooks=%s%s\n" % (
             DIM, ev.get("plugin") or "sudo-watch-stream", ev.get("state"),
@@ -472,7 +493,7 @@ for raw in sys.stdin:
     else:
         # Never hide anything: an unknown event prints in FULL (the old
         # renderer truncated this at 300 chars, which could hide payloads).
-        out("%s%s[%s] %s%s\n" % (hk_prefix(ev), DIM, kind,
+        out("%s%s[%s] %s%s\n" % (hk_prefix(ev), DIM, safe(kind),
                                   json.dumps(ev, ensure_ascii=False), OFF))
 PYEOF
 else

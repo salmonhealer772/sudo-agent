@@ -447,6 +447,18 @@ id) are the authoritative one-at-a-time evidence — see the `results` array of
   both newline counts when they differ only in whitespace, and the
   **authoritative text printed in full** if the live lane is missing actual
   content. `final_text` is always on the tape and is the text to trust.
+- **The console neutralises control bytes; the tape does not.** A raw ESC in
+  model output or in a mirrored log line is executed by the terminal —
+  `\x1b[2A` moves the cursor up over what was already printed, `\x1b[?25l`
+  hides the cursor, `\x1b[31m` recolours the rest of the screen, `\x0d`
+  overwrites the line, `\x07` beeps. `stream.sh` therefore renders every
+  non-printing C0 byte and DEL as a visible `\xNN` (`\t` and `\n` are
+  formatting and pass through untouched). Nothing is truncated, collapsed or
+  hidden — the operator sees exactly which control byte was there — and the
+  terminal cannot be driven by the agent. `stream.jsonl` still carries the true
+  value (JSON escapes it), so the tape stays byte-faithful for any consumer.
+  Measured before the fix: 6 raw ESC + 1 BEL reached the console from one
+  synthetic delta; after it, 0, with the payload fully visible as text.
 - An interrupt mid-stream (`hermes -z` killed, container restart) leaves the
   turn with no `stream_end` at all — the tape simply stops. That is the honest
   representation of a killed turn; nothing synthesises a fake ending.
