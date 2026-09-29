@@ -851,7 +851,10 @@ def _on_stream_end(final_text="", finished=True, error=None, **kw) -> None:
             "reasoning_chars": turn["reasoning_chars"],
         }, **fields, **_hk_fields())
         _enqueue(ev)
-        _set_phase("idle")
+        # Carry the turn fields on the closing transition too, so this beat is
+        # attributable like every other one (a consumer filtering by turn would
+        # otherwise drop the boundary that closes it).
+        _set_phase("idle", **fields)
         # NOTE: the active turn id is deliberately NOT cleared here.
         # on_stream_end marks the end of ONE API CALL, not of the turn: a
         # tool-calling turn continues with further iterations, and clearing the

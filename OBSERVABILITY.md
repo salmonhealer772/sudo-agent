@@ -450,6 +450,16 @@ id) are the authoritative one-at-a-time evidence — see the `results` array of
 - An interrupt mid-stream (`hermes -z` killed, container restart) leaves the
   turn with no `stream_end` at all — the tape simply stops. That is the honest
   representation of a killed turn; nothing synthesises a fake ending.
+- **`stream.jsonl` is a merge of every Hermes process that loaded the plugin**,
+  not one writer. The gateway (its own `plugin_state` carries its `pid`, and
+  `/status` → `stream.plugin.in_gateway` proves it is the real gateway) plus
+  each `hermes -z` / CLI process appends to the same file, each with its own
+  `seq` counter and its own phase machine. Consequences worth knowing when
+  reading the tape: `seq` is per-process and restarts at 1 (do not use it as a
+  total order — use `ts`); and the gateway's watchdog keeps emitting
+  `phase:"idle"` beats with an **empty `turn_id`** while a CLI turn runs, which
+  is correct — that instance is not in that turn. Filter by `turn_id` to follow
+  one turn, and by `plugin_state.pid` to follow one process.
 - `tool_call` / `tool_result` args and results are **untruncated by default**.
   A tool that returns tens of megabytes will put tens of megabytes on one
   `stream.jsonl` line; set `SUDO_WATCH_TOOL_MAX_CHARS` on the agent if that
