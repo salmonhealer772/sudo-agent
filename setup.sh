@@ -22,27 +22,51 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# _retry N "description" cmd [args...] — run cmd up to N times with backoff.
+# Makes network/build steps survive transient failures instead of dying once.
+_retry() {
+  local n="$1" desc="$2"; shift 2
+  local i=1
+  while (( i <= n )); do
+    if "$@"; then return 0; fi
+    echo "⚠ ($desc) attempt $i/$n failed — retrying in ${i}s..." >&2
+    sleep "$i"
+    (( i++ ))
+  done
+  return 1
+}
+
 # --- Build images ---
 if ! docker image inspect hermes-agent:latest &>/dev/null; then
   echo "→ Building base Hermes Agent image (3-5 min)..."
   TMP_DIR=$(mktemp -d) || { echo "Failed to create temp dir"; exit 1; }
-  git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR" || { echo "Git clone failed. Check internet."; exit 1; }
-  docker build -t hermes-agent:latest "$TMP_DIR" || { echo "Docker build failed."; exit 1; }
+  _retry 3 "git clone hermes-agent" git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$TMP_DIR" \
+    || { echo "Git clone failed. Check internet."; exit 1; }
+  _retry 3 "docker build hermes-agent" docker build -t hermes-agent:latest "$TMP_DIR" \
+    || { echo "Docker build failed."; exit 1; }
   rm -rf "$TMP_DIR"
   echo "✓ Base image built"
 fi
 
 echo "→ Building sudo-agent image..."
-docker build -t sudo-agent:latest -f "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR" || { echo "Sudo-agent build failed."; exit 1; }
+_retry 3 "docker build sudo-agent" docker build -t sudo-agent:latest -f "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR" \
+  || { echo "Sudo-agent build failed."; exit 1; }
 echo "✓ sudo-agent image built"
 
-# --- Prompt for DeepSeek API key ---
+# --- Prompt for DeepSeek API key (env-first: never prompt if a key is available) ---
 ENV_FILE="$SCRIPT_DIR/.env"
 CONFIG_FILE="$SCRIPT_DIR/config.yaml"
 
-# Always create/overwrite .env with a fresh API key prompt
-# (Previous key may be stale, so we always prompt)
-if true; then
+# Resolve the key WITHOUT prompting unless necessary:
+#   (1) DEEPSEEK_API_KEY / DEEPSEEK_KEY in the environment -> use it, no prompt
+#   (2) a non-empty DEEPSEEK_API_KEY already in $ENV_FILE -> reuse it, no prompt
+#   (3) otherwise fall back to an interactive read (the sudo-fleet bridge feeds
+#       the key on stdin, which this `read` consumes).
+DEEPSEEK_KEY="${DEEPSEEK_API_KEY:-${DEEPSEEK_KEY:-}}"
+if [[ -z "$DEEPSEEK_KEY" ]] && [[ -f "$ENV_FILE" ]]; then
+  DEEPSEEK_KEY="$(sed -n 's/^DEEPSEEK_API_KEY=//p' "$ENV_FILE" 2>/dev/null | head -n1)"
+fi
+if [[ -z "$DEEPSEEK_KEY" ]]; then
   echo ""
   echo "┌─────────────────────────────────────────────┐"
   echo "│  DeepSeek API Key Required                   │"
@@ -52,25 +76,25 @@ if true; then
   echo "└─────────────────────────────────────────────┘"
   echo ""
   read -r -p "Paste your DeepSeek API key: " DEEPSEEK_KEY
-
-  if [[ -z "$DEEPSEEK_KEY" ]]; then
-    echo "No key entered. Setup incomplete — run setup.sh again."
-    exit 1
-  fi
-
-  # Write .env — use sudo if dir is root-owned, otherwise direct
-  if ! echo "" >> "$ENV_FILE" 2>/dev/null; then
-    echo "→ Repo is root-owned. Using sudo to save credentials..."
-    { echo "# sudo-agent config (set by setup.sh)"; echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY"; } | sudo tee "$ENV_FILE" > /dev/null 2>&1 || {
-      echo "✗ Could not write .env. Run: sudo chown -R \$USER:\$USER $SCRIPT_DIR" >&2
-      exit 1
-    }
-  else
-    echo "# sudo-agent config (set by setup.sh)" > "$ENV_FILE"
-    echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY" >> "$ENV_FILE"
-  fi
-  echo "✓ API key saved to $ENV_FILE"
 fi
+
+if [[ -z "$DEEPSEEK_KEY" ]]; then
+  echo "No key entered. Setup incomplete — run setup.sh again."
+  exit 1
+fi
+
+# Write .env — use sudo if dir is root-owned, otherwise direct
+if ! echo "" >> "$ENV_FILE" 2>/dev/null; then
+  echo "→ Repo is root-owned. Using sudo to save credentials..."
+  { echo "# sudo-agent config (set by setup.sh)"; echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY"; } | sudo tee "$ENV_FILE" > /dev/null 2>&1 || {
+    echo "✗ Could not write .env. Run: sudo chown -R \$USER:\$USER $SCRIPT_DIR" >&2
+    exit 1
+  }
+else
+  echo "# sudo-agent config (set by setup.sh)" > "$ENV_FILE"
+  echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY" >> "$ENV_FILE"
+fi
+echo "✓ API key saved to $ENV_FILE"
 
 # --- Ensure config.yaml ---
 if [[ ! -f "$CONFIG_FILE" ]]; then
