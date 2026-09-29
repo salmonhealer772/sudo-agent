@@ -85,4 +85,4 @@ fi
   done
 ) &
 
-exec /opt/hermes/docker/entrypoint-dispatch.sh "$@"
+exec /opt/hermes/docker/main-wrapper.sh "$@"
