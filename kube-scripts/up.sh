@@ -176,6 +176,22 @@ if ! python3 "$SCRIPT_DIR/watch_plugin_enable.py" "$PER_AGENT_CONFIG" "$WATCH_PL
   echo "  stream hooks, stream.sh would tail a file that never appears." >&2
   exit 1
 fi
+
+# Content digest of everything shipped via ConfigMap into the pod (the sidecar
+# daemon + the plugin). A ConfigMap-only change does NOT roll a Deployment, and
+# a running process never re-imports a module it already loaded — so without
+# this annotation a changed watch_sidecar.py or plugin would silently keep
+# running the OLD code in every live pod. It goes on the pod template, so
+# `kubectl apply` recreates the pod exactly when those files change.
+WATCH_SCRIPTS_SHA="$(sha256sum "$WATCH_SIDECAR" \
+    "$WATCH_PLUGIN_DIR/plugin.yaml" "$WATCH_PLUGIN_DIR/__init__.py" 2>/dev/null \
+  | awk '{print $1}' | sha256sum | awk '{print $1}')"
+if [[ -z "$WATCH_SCRIPTS_SHA" ]]; then
+  echo "✗ could not compute the watch-scripts digest — refusing to deploy an" >&2
+  echo "  unversioned sidecar/plugin (a stale one would go unnoticed)." >&2
+  exit 1
+fi
+echo "→ watch scripts digest: ${WATCH_SCRIPTS_SHA:0:12}"
 # ── Preserve operator-added env vars ─────────────────────────────────────────
 # up.sh REGENERATES this Deployment from the template below, so the live object
 # is REPLACED, not merged. Any env var an operator added to the running
@@ -243,6 +259,13 @@ spec:
       labels:
         app: sudo-agent
         agent: $NAME
+      annotations:
+        # Digest of the ConfigMap-shipped watch scripts (sidecar + plugin).
+        # Bumping it forces a new pod, which is the ONLY way a changed script
+        # takes effect: `kubectl apply` does not roll a Deployment for a
+        # ConfigMap edit, and a live process keeps the module it already
+        # imported. See the digest note in up.sh.
+        sudo-agent/watch-scripts-sha: "$WATCH_SCRIPTS_SHA"
     spec:
       shareProcessNamespace: true
       hostNetwork: true
