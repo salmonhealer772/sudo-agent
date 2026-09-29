@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# stream.sh — the operator's daily driver: EVERY token the agent emits, live.
+# stream.sh — the operator's daily driver: the WHOLE agent runtime, live.
 #
 # Usage:
-#   bash kube-scripts/stream.sh --<name>              live token stream
+#   bash kube-scripts/stream.sh --<name>              THE FIREHOSE (default)
 #   bash kube-scripts/stream.sh <name>                same, bare spelling
 #   bash kube-scripts/stream.sh --<name> --thinking   only reasoning/thinking
 #   bash kube-scripts/stream.sh --<name> --answer     only answer text
 #   bash kube-scripts/stream.sh --<name> --context    also dump the full input
 #                                                     context of each API call
+#   bash kube-scripts/stream.sh --<name> --no-logs    hide the agent.log /
+#                                                     gateway.log mirror
+#   bash kube-scripts/stream.sh --<name> --no-activity hide the liveness beats
 #   bash kube-scripts/stream.sh --<name> --events     the state.db event tape
 #                                                     (the pre-token view)
 #   bash kube-scripts/stream.sh --<name> -t           transcript mode: last 40
@@ -17,23 +20,29 @@
 #
 # Ctrl-C returns to the prompt INSTANTLY (no hanging children).
 #
+# WHAT THE DEFAULT VIEW SHOWS
+#   Everything the runtime emits, as it happens, in one feed — the console and
+#   the tape carry the SAME level of detail by explicit operator request:
+#     * every token, verbatim (no truncation, no whitespace collapsing), with
+#       reasoning and answer as visually distinct lanes;
+#     * tool calls with FULL arguments and tool results with FULL bodies;
+#     * timestamped [activity] beats whenever the agent is blocked — waiting on
+#       the provider, generating tool-call arguments, or sitting inside a tool.
+#       These are what stop the screen ever freezing silently;
+#     * housekeeping (cron / subagent / curator) turns, clearly tagged;
+#     * the agent's own log lines (agent.log / gateway.log), so errors,
+#       warnings and retries appear in the same feed.
+#   Trim with --no-logs / --no-activity, or use --transcript for the clean
+#   digest. Trimming is opt-in; verbose is the default.
+#
 # WHERE THE TOKENS COME FROM
 #   The watch sidecar alone cannot do this: it polls state.db, and Hermes only
-#   writes a row there when a message is COMPLETE. The tokens are written by
-#   the sudo-watch-stream plugin (kube-scripts/watch_plugin/), which hooks
-#   Hermes' native stream callbacks and appends every chunk to
+#   writes a row there when a message is COMPLETE. Everything above is written
+#   by the sudo-watch-stream plugin (kube-scripts/watch_plugin/), which hooks
+#   Hermes' native stream + tool + request hooks and appends each event to
 #   /opt/data/watch/stream.jsonl as it is produced. This script tails that
 #   file inside the watch container (no HTTP, no port-forward), so a "stream
 #   with no plugin" is loud, never a silent empty screen.
-#
-# RENDERING
-#   Each chunk is written out IMMEDIATELY, verbatim — no 200-char truncation,
-#   no whitespace collapsing (both of which the old event view did, and which
-#   made streamed text unreadable). Reasoning runs are rendered distinctly
-#   from answer runs (dim "[think]" vs bold "[reply]" when stdout is a tty;
-#   `--no-color` for plain text). Every turn gets a header line with its turn
-#   id, iteration, model/provider and surface.
-
 set -u
 
 STREAM_FILE="/opt/data/watch/stream.jsonl"
@@ -108,6 +117,8 @@ MODE="tokens"        # tokens | events | transcript
 WANT_THINKING=0
 WANT_ANSWER=0
 WANT_CONTEXT=0
+NO_LOGS=0
+NO_ACTIVITY=0
 NO_COLOR=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -117,6 +128,8 @@ while [ $# -gt 0 ]; do
     --thinking|--think) WANT_THINKING=1; shift ;;
     --answer|--reply)   WANT_ANSWER=1; shift ;;
     --context|--full)   WANT_CONTEXT=1; shift ;;
+    --no-logs|--quiet-logs) NO_LOGS=1; shift ;;
+    --no-activity|--quiet-activity) NO_ACTIVITY=1; shift ;;
     --no-color)   NO_COLOR=1; shift ;;
     -h|--help)    usage; exit 0 ;;
     --*)          NAME="${1#-}"; NAME="${NAME#-}"; shift ;;
@@ -165,6 +178,8 @@ import time
 only_thinking = os.environ.get("ST_ONLY_THINKING") == "1" and os.environ.get("ST_ONLY_ANSWER") != "1"
 only_answer = os.environ.get("ST_ONLY_ANSWER") == "1" and os.environ.get("ST_ONLY_THINKING") != "1"
 show_context = os.environ.get("ST_CONTEXT") == "1"
+show_logs = os.environ.get("ST_NO_LOGS") != "1"
+show_activity = os.environ.get("ST_NO_ACTIVITY") != "1"
 color = sys.stdout.isatty() and os.environ.get("ST_NO_COLOR") != "1"
 
 DIM = "\033[2m" if color else ""
@@ -173,6 +188,7 @@ CYAN = "\033[36m" if color else ""
 GREEN = "\033[32m" if color else ""
 YELLOW = "\033[33m" if color else ""
 RED = "\033[31m" if color else ""
+MAGENTA = "\033[35m" if color else ""
 OFF = "\033[0m" if color else ""
 
 W = sys.stdout.write
@@ -182,12 +198,35 @@ def out(s):
 
 last_run = None          # "reasoning" | "text" | None — for run prefixes
 turn_active = False
+turn_hk = False          # is the turn we are inside a housekeeping turn?
 
 def stamp(ts):
     try:
         return time.strftime("%H:%M:%S", time.localtime(float(ts)))
     except Exception:
         return "--:--:--"
+
+def hk_prefix(ev):
+    """Housekeeping marker; remembered for the whole turn so every line of a
+    cron/subagent turn is visibly tagged, not just its header."""
+    global turn_hk
+    if ev.get("housekeeping") is not None:
+        turn_hk = bool(ev.get("housekeeping"))
+    if turn_hk:
+        return "%sHOUSEKEEPING(%s)%s " % (YELLOW, ev.get("housekeeping_reason") or "?", OFF)
+    return ""
+
+def body(value, indent=2):
+    """FULL body: strings verbatim, anything else pretty-printed JSON.
+    Never truncates and never collapses whitespace."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=indent)
+    except Exception:
+        return str(value)
 
 def start_run(kind):
     global last_run
@@ -220,10 +259,14 @@ for raw in sys.stdin:
     if kind == "turn_start":
         end_run()
         turn_active = True
-        out("%s┌── turn %s · iter %s · %s (%s) · surface=%s · %s%s\n" % (
-            BOLD + CYAN, ev.get("turn_id") or "?", ev.get("iteration"),
+        turn_hk = bool(ev.get("housekeeping"))
+        out("%s%s\u250c\u2500\u2500 turn %s \u00b7 iter %s \u00b7 %s (%s) \u00b7 surface=%s \u00b7 %s%s\n" % (
+            BOLD + CYAN, "", ev.get("turn_id") or "?", ev.get("iteration"),
             ev.get("model") or "?", ev.get("provider") or "?",
             ev.get("surface") or "?", ts, OFF))
+        if turn_hk:
+            out("%s\u2502  housekeeping turn (%s) \u2014 recorded AND shown, not suppressed%s\n" % (
+                YELLOW, ev.get("housekeeping_reason") or "?", OFF))
     elif kind == "input_context":
         end_run()
         msgs = ev.get("messages") or []
@@ -231,8 +274,8 @@ for raw in sys.stdin:
         for m in msgs:
             r = (m or {}).get("role") or "?"
             roles[r] = roles.get(r, 0) + 1
-        out("%s│ context: %d msgs (%s) · ~%s tokens · %s chars · api_mode=%s · call #%s%s\n" % (
-            DIM, len(msgs),
+        out("%s%s\u2502 context: %d msgs (%s) \u00b7 ~%s tokens \u00b7 %s chars \u00b7 api_mode=%s \u00b7 call #%s%s\n" % (
+            hk_prefix(ev), DIM, len(msgs),
             ", ".join("%s:%d" % (k, v) for k, v in sorted(roles.items())),
             ev.get("approx_input_tokens"), ev.get("request_char_count"),
             ev.get("api_mode") or "?", ev.get("api_call_count"), OFF))
@@ -240,18 +283,18 @@ for raw in sys.stdin:
             sp = ev.get("system_prompt") or ""
             um = ev.get("user_message") or ""
             def block(label, text):
-                out("%s│ %s (%d chars):%s\n" % (YELLOW, label, len(text), OFF))
+                out("%s\u2502 %s (%d chars):%s\n" % (YELLOW, label, len(text), OFF))
                 out(text if text.endswith("\n") else text + "\n")
-                out("%s│ ---%s\n" % (YELLOW, OFF))
+                out("%s\u2502 ---%s\n" % (YELLOW, OFF))
             if sp:
                 block("system_prompt", sp)
             if um:
                 block("user_message", um)
             for m in msgs:
-                out("%s│   [%s] %s %d chars%s\n" % (
+                out("%s\u2502   [%s] %s %d chars%s\n" % (
                     DIM, (m or {}).get("i"), (m or {}).get("role"),
                     (m or {}).get("chars") or 0, OFF))
-            out("%s│ (full sanitised request body: input_context.request_body in %s)%s\n" % (
+            out("%s\u2502 (full sanitised request body: input_context.request_body in %s)%s\n" % (
                 DIM, ev.get("file") or "stream.jsonl", OFF))
     elif kind == "delta":
         dkind = ev.get("kind") or "text"
@@ -262,14 +305,48 @@ for raw in sys.stdin:
         start_run(dkind)
         # VERBATIM: no truncation, no whitespace collapsing, no re-encoding
         out(ev.get("delta") or "")
+    elif kind == "tool_call":
+        end_run()
+        out("%s%s\u251c\u2500 TOOL %s (%s chars of args) \u00b7 %s%s\n" % (
+            hk_prefix(ev), MAGENTA, ev.get("tool") or "?", ev.get("args_chars"), ts, OFF))
+        out(body(ev.get("args")) + "\n")
+    elif kind == "tool_result":
+        end_run()
+        err = ev.get("error_message")
+        out("%s%s\u251c\u2500 RESULT %s \u00b7 %s \u00b7 %sms \u00b7 %s chars%s%s\n" % (
+            hk_prefix(ev), MAGENTA, ev.get("tool") or "?",
+            ev.get("status") or "?", ev.get("duration_ms"),
+            ev.get("result_chars"), (" \u00b7 error=" + str(err)) if err else "", OFF))
+        out(body(ev.get("result")) + "\n")
+    elif kind == "activity":
+        if not show_activity:
+            continue
+        end_run()   # never glue a beat onto an open token run
+        ph = ev.get("phase") or "?"
+        tool = (" " + (ev.get("tool") or "")) if ev.get("tool") else ""
+        blocked = ph in ("tool_running", "provider_wait", "tool_args")
+        paint = YELLOW if blocked else DIM
+        out("%s%s\u00b7 %s [activity] %s%s \u00b7 %s \u00b7 in-phase %.1fs%s\n" % (
+            hk_prefix(ev), paint, ts, ph, tool, ev.get("reason") or "",
+            float(ev.get("phase_elapsed") or 0), OFF))
+    elif kind == "log":
+        if not show_logs:
+            continue
+        end_run()   # never glue a log line onto an open token run
+        lvl = ev.get("level") or ""
+        paint = RED if lvl in ("ERROR", "CRITICAL", "FATAL") else (
+            YELLOW if lvl in ("WARNING", "WARN") else DIM)
+        out("%s\u00b7 %s [%s%s] %s%s\n" % (
+            paint, ts, ev.get("stream") or "log",
+            (" " + lvl) if lvl else "", ev.get("line") or "", OFF))
     elif kind == "stream_end":
         end_run()
         err = ev.get("error")
-        note = " · synthesized (this call did not stream)" if ev.get("synthesized") else ""
-        out("%s└── end · finished=%s · deltas=%s · text=%sc · reasoning=%sc%s%s%s\n" % (
-            BOLD + CYAN, ev.get("finished"), ev.get("delta_count"),
+        note = " \u00b7 synthesized (this call did not stream)" if ev.get("synthesized") else ""
+        out("%s%s\u2514\u2500 end \u00b7 finished=%s \u00b7 deltas=%s \u00b7 text=%sc \u00b7 reasoning=%sc%s%s%s\n" % (
+            BOLD + CYAN, "", ev.get("finished"), ev.get("delta_count"),
             ev.get("text_chars"), ev.get("reasoning_chars"),
-            (" · error=" + str(err)) if err else "", note, OFF))
+            (" \u00b7 error=" + str(err)) if err else "", note, OFF))
         turn_active = False
     elif kind == "completion":
         # Fired on EVERY finished API call. Only worth showing when that call
@@ -277,14 +354,17 @@ for raw in sys.stdin:
         # where this is the only place the answer appears.
         if not ev.get("streamed"):
             end_run()
-            out("%s[non-streamed answer]%s %s\n" % (YELLOW, OFF,
-                                                    ev.get("text") or ""))
+            out("%s%s[non-streamed answer]%s %s\n" % (
+                hk_prefix(ev), YELLOW, OFF, ev.get("text") or ""))
     elif kind == "plugin_state":
         out("%s[plugin] %s loaded=%s hooks=%s%s\n" % (
             DIM, ev.get("plugin") or "sudo-watch-stream", ev.get("state"),
             ",".join(ev.get("hooks") or []), OFF))
     else:
-        out("%s[%s] %s%s\n" % (DIM, kind, json.dumps(ev, ensure_ascii=False)[:300], OFF))
+        # Never hide anything: an unknown event prints in FULL (the old
+        # renderer truncated this at 300 chars, which could hide payloads).
+        out("%s%s[%s] %s%s\n" % (hk_prefix(ev), DIM, kind,
+                                  json.dumps(ev, ensure_ascii=False), OFF))
 PYEOF
 else
 # ── legacy event-tape renderer (--events), unchanged in spirit ─────────────
@@ -374,6 +454,7 @@ FIFO="$(mktemp -u /tmp/stream-fifo.XXXXXX)"
 mkfifo "$FIFO"
 ST_ONLY_THINKING="$WANT_THINKING" ST_ONLY_ANSWER="$WANT_ANSWER" \
 ST_CONTEXT="$WANT_CONTEXT" ST_NO_COLOR="$NO_COLOR" \
+ST_NO_LOGS="$NO_LOGS" ST_NO_ACTIVITY="$NO_ACTIVITY" \
   python3 -u "$FILTER" < "$FIFO" &
 FILTER_PID=$!
 if [ "$MODE" = "events" ]; then
