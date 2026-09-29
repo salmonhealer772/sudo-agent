@@ -42,16 +42,22 @@ Three jobs in one process (threads):
       GET /events-stream -> backlog dump + live tail of NEW EVENTS (the
                           original /stream behaviour, preserved verbatim)
       GET /stream?n=20&kinds=reasoning,text&since=<byte offset>
-                       -> the TOKEN-LEVEL stream written by the
+                       -> the WHOLE-RUNTIME stream written by the
                           sudo-watch-stream plugin (<log_dir>/stream.jsonl):
                           backlog (last N MATCHING lines, default 20) + live
-                          tail of NEW stream lines. `kinds` filters on the
-                          delta kind for delta lines and on the event name for
-                          every other line; `since` resumes the live tail at an
-                          exact byte offset instead of EOF. There is no
-                          stream.jsonl until the plugin is loaded and a turn
-                          runs, so this replies 404 with a clear message
-                          instead of an empty 200.
+                          tail of NEW stream lines. THE DEFAULT IS EVERYTHING:
+                          with no `kinds` every line is served — tokens
+                          (delta: text + reasoning), input_context, tool_call
+                          and tool_result (FULL args and FULL bodies),
+                          activity (the liveness beats), housekeeping-tagged
+                          cron/subagent/curator turns, the mirrored agent log
+                          lines, turn/stream boundaries and completions.
+                          `kinds` is an OPT-IN filter (delta kind for delta
+                          lines, event name for every other line); `since`
+                          resumes the live tail at an exact byte offset instead
+                          of EOF. There is no stream.jsonl until the plugin is
+                          loaded and a turn runs, so this replies 404 with a
+                          clear message instead of an empty 200.
 
    Plain unframed bytes with Connection: close (no chunked encoding) on both
    tails; client disconnects close the socket immediately.
@@ -131,6 +137,11 @@ STATE = {
         "reasoning_chars": 0,
         "active_turn_id": "",
         "turns": 0,
+        "last_activity_ts": None,   # last liveness beat
+        "last_phase": None,         # phase reported by the last beat
+        "last_tool_ts": None,       # last tool_call / tool_result
+        "last_log_ts": None,        # last mirrored agent log line
+        "housekeeping_turns": 0,    # cron/subagent/curator turns seen
     },
 }
 _LOCK = threading.Lock()  # guards events.jsonl appends + STATE counters
@@ -380,6 +391,16 @@ def _stream_tap_once():
                         st["active_turn_id"] = ev["turn_id"]
                 if ev.get("event") == "turn_start":
                     st["turns"] += 1
+                    if ev.get("housekeeping"):
+                        st["housekeeping_turns"] += 1
+                if ev.get("event") == "activity":
+                    st["last_activity_ts"] = ts
+                    if ev.get("phase"):
+                        st["last_phase"] = ev["phase"]
+                if ev.get("event") in ("tool_call", "tool_result"):
+                    st["last_tool_ts"] = ts
+                if ev.get("event") == "log":
+                    st["last_log_ts"] = ts
     except OSError:
         return
     if consumed != off:
@@ -697,6 +718,8 @@ def _plugin_status():
     if isinstance(st, dict):
         info["loaded"] = bool(st.get("loaded"))
         info["hooks_registered"] = list(st.get("hooks") or [])
+        info["phase"] = st.get("phase")
+        info["log_capture"] = st.get("log_capture")
         info["counts"] = dict(st.get("counts") or {})
         info["dropped"] = st.get("dropped") or 0
         pid = st.get("pid")
@@ -732,11 +755,23 @@ def _stream_status():
         "reasoning_chars": st["reasoning_chars"],
         "active_turn_id": st["active_turn_id"],
         "turns": st["turns"],
+        "last_activity_ts": st["last_activity_ts"],
+        "last_phase": st["last_phase"],
+        "last_tool_ts": st["last_tool_ts"],
+        "last_log_ts": st["last_log_ts"],
+        "housekeeping_turns": st["housekeeping_turns"],
         "plugin": _plugin_status(),
     }
-    for key, name in (("last_ts", "age_s"), ("last_delta_ts", "delta_age_s")):
+    for key, name in (("last_ts", "age_s"), ("last_delta_ts", "delta_age_s"),
+                      ("last_activity_ts", "activity_age_s"),
+                      ("last_tool_ts", "tool_age_s"),
+                      ("last_log_ts", "log_age_s")):
         ts = out[key]
         out[name] = round(now - ts, 1) if isinstance(ts, (int, float)) else None
+    # silent_for_s is the "never silent" measurement: how long since ANY tape
+    # line. With the activity watchdog alive this stays <= ~2s while a turn is
+    # in flight, which is the whole contract.
+    out["silent_for_s"] = out["age_s"]
     with _WM_LOCK:
         out["cursor_offset"] = _WM.get("stream_offset")
     return out
