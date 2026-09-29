@@ -5,6 +5,10 @@
 
 FROM hermes-agent:latest
 
+# The modern hermes-agent base ships uv under /opt/hermes/tools/uv-<ver>-linux-x64/
+# (NOT on PATH). Expose it so the `uv pip install` steps below can resolve it.
+RUN ln -sf "$(find /opt/hermes/tools -maxdepth 2 -name uv -type f | head -1)" /usr/local/bin/uv
+
 # Install sudo, fuse (for filesystem mounting), and set up passwordless sudo
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
