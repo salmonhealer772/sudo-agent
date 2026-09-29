@@ -358,6 +358,7 @@ def _activity_loop() -> None:
                 last_event = _state["last_event_ts"] or 0.0
                 last_beat = _state["last_beat_ts"] or 0.0
                 beats = int(_state["phase_beats"] or 0)
+                turn_id = _state["active_turn_id"] or ""
             idle = phase in ("idle", "", "turn_end")
             period = IDLE_EVERY_SEC if idle else ACTIVITY_EVERY_SEC
             if period <= 0:
@@ -373,6 +374,7 @@ def _activity_loop() -> None:
                 _state["last_beat_ts"] = now
                 _state["phase_beats"] = int(_state["phase_beats"] or 0) + 1
             ev = {"event": "activity", "phase": phase, "tool": tool,
+                  "turn_id": turn_id,
                   "reason": _PHASE_REASON.get(phase, phase),
                   "beat": "idle" if idle else "heartbeat",
                   "phase_since": since,

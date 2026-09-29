@@ -142,6 +142,7 @@ STATE = {
         "last_tool_ts": None,       # last tool_call / tool_result
         "last_log_ts": None,        # last mirrored agent log line
         "housekeeping_turns": 0,    # cron/subagent/curator turns seen
+        "housekeeping_ids": [],     # their turn ids (bounded)
     },
 }
 _LOCK = threading.Lock()  # guards events.jsonl appends + STATE counters
@@ -391,8 +392,19 @@ def _stream_tap_once():
                         st["active_turn_id"] = ev["turn_id"]
                 if ev.get("event") == "turn_start":
                     st["turns"] += 1
-                    if ev.get("housekeeping"):
-                        st["housekeeping_turns"] += 1
+                if ev.get("housekeeping"):
+                    # Count DISTINCT housekeeping turns. A cron/subagent turn
+                    # never fires on_stream_start (it does not stream at all),
+                    # so counting turn_start events reported 0 while the
+                    # console was visibly rendering HOUSEKEEPING(cron) lines.
+                    tid = ev.get("turn_id") or ""
+                    if tid:
+                        ids = st.setdefault("housekeeping_ids", [])
+                        if tid not in ids:
+                            ids.append(tid)
+                            if len(ids) > 200:
+                                del ids[:100]
+                            st["housekeeping_turns"] = len(ids)
                 if ev.get("event") == "activity":
                     st["last_activity_ts"] = ts
                     if ev.get("phase"):
