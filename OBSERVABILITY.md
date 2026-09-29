@@ -161,8 +161,14 @@ and a monotonic `seq`):
 | `turn_start` | `on_stream_start` | turn_id, iteration, session_id, model, provider, surface |
 | `input_context` | `pre_api_request` | turn_id, api_call_count, api_request_id, session_id, model, provider, api_mode, platform, message_count, tool_count, approx_input_tokens, request_char_count, max_tokens, **messages** (role + chars + preview each), **request_body** (sanitised provider body, bounded), **system_prompt**, **user_message** |
 | `delta` | `on_stream_delta` | kind (`text` \| `reasoning`), delta (raw chunk), turn_id, iteration, text_chars, reasoning_chars |
-| `stream_end` | `on_stream_end` | final_text, finished, error, delta_count, text_chars, reasoning_chars |
+| `stream_end` | `on_stream_end` | final_text, finished, error, delta_count, text_chars, reasoning_chars; `synthesized: true` on a call that never streamed |
 | `completion` | `post_api_request` | finish_reason, api_duration, usage, response_model, assistant_content_chars, assistant_tool_call_count, **streamed** (bool), text (only when nothing streamed) |
+
+A call that never streams (cron, subagent/delegated child, provider without
+SSE) emits `input_context` + a `stream_end` marked `synthesized: true` with
+`delta_count: 0` + a `completion` with `streamed: false` and the finished
+text — measured on this fleet: cron and subagent turns do NOT stream, cli /
+gateway turns do.
 
 Notes that matter operationally:
 
@@ -302,15 +308,15 @@ id) are the authoritative one-at-a-time evidence — see the `results` array of
 
 ## Known limitations (token stream)
 
-- A path that never streams still gets `input_context` (fires on every API
-  call) and a `completion` event carrying the finished text — but it cannot
-  produce per-token deltas by definition. As of this build, Hermes'
-  conversation loop always prefers the streaming route
-  (`_use_streaming = True`), except providers that refuse SSE and
-  `copilot-acp`; `on_stream_delta` therefore fires on cli/gateway/cron/subagent
-  turns. If a future Hermes version reintroduces a non-streaming gate for
-  cron/subagent (it did once, to avoid a nested-thread deadlock),
-  `completion.streamed=false` will show it immediately.
+- **cron and subagent turns do NOT stream on this build** (measured: their
+  `completion` events carry `streamed: false`). They still emit
+  `input_context`, a `synthesized` `stream_end`, and the finished answer text
+  in `completion`, so nothing is hidden — but they cannot show per-token
+  deltas. cli / gateway (api_server) turns DO stream: that is the operator's
+  interactive path, and it is the one `stream.sh` is built around. The direct
+  (non-streaming) route here is Hermes' deliberate avoidance of a
+  nested-thread deadlock for those contexts; the plugin reports the gap
+  instead of faking tokens.
 - The plugin is per-agent: an agent that has not been rolled still has no
   `stream.jsonl`, and `stream.sh` says so loudly rather than showing an empty
   screen.

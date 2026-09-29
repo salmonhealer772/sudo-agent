@@ -139,9 +139,12 @@ matter of polling faster.
    the runtime. The plugin keeps the observer's core property — it only reads
    the agent, never changes it.
 6. **Non-streaming paths are covered, not ignored.** A turn that never streams
-   (provider refuses SSE, `copilot-acp`, a MoA facade with no consumers) still
-   gets `input_context` and a `completion` event carrying the finished text
-   with `streamed: false`. Nothing is silently absent.
+   is a measured reality on this fleet for cron and delegated/subagent
+   contexts (cli/gateway turns do stream). Those calls still emit
+   `input_context`, a `stream_end` marked `synthesized: true` (`delta_count:
+   0`) and a `completion` carrying the finished text with `streamed: false`.
+   Nothing is silently absent, and the gap is labelled rather than papered
+   over.
 7. **Additive by construction.** `stream.jsonl` / `plugin.json` and the new
    `/stream` behaviour sit beside `events.jsonl`, `transcript.txt`, state.db
    capture, the MCP prompt surface and the Redis queue; the previous events

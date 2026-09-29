@@ -30,7 +30,8 @@ EVENT SCHEMA (all lines carry ``ts`` (epoch float) and a monotonic ``seq``)
                              iteration, session_id, model, provider, surface,
                              text_chars, reasoning_chars}
   {"event": "stream_end",    turn_id, iteration, final_text, finished, error,
-                             text_chars, reasoning_chars, delta_count}
+                             text_chars, reasoning_chars, delta_count,
+                             synthesized (only on a never-streamed call)}
   {"event": "completion",    turn_id, api_call_count, finish_reason,
                              api_duration, response_model, usage,
                              assistant_content_chars,
@@ -39,7 +40,10 @@ EVENT SCHEMA (all lines carry ``ts`` (epoch float) and a monotonic ``seq``)
 ``completion`` exists for the paths that never stream (a provider that refuses
 SSE, copilot-acp, a MoA facade without consumers): ``pre_api_request`` and
 ``post_api_request`` still fire there, so the operator still gets the input
-context and, when nothing streamed, the finished answer text.
+context and, when nothing streamed, the finished answer text. Those calls also
+get a ``stream_end`` with ``synthesized: true`` and ``delta_count: 0``, so a
+consumer can close the turn it saw an ``input_context`` for (the runtime only
+fires ``on_stream_end`` on the streaming path).
 
 HARD RULES (a plugin must never hurt the agent it observes)
 -----------------------------------------------------------
@@ -525,6 +529,29 @@ def _on_post_api_request(**kw) -> None:
             text_out = (text[:CONTEXT_MAX_CHARS] + "…[truncated]") if trunc else text
 
         usage, _t, _s = _bound_json(kw.get("usage"), 2000)
+        if not streamed:
+            # A call that never streamed (cron / subagent / provider without
+            # SSE) still gets a stream boundary, explicitly marked as
+            # synthesised: the runtime fires on_stream_end only on the
+            # streaming path, and a consumer must be able to close the turn it
+            # saw an input_context for. delta_count 0 = nothing streamed.
+            _enqueue({
+                "event": "stream_end",
+                "synthesized": True,
+                "turn_id": turn_id,
+                "iteration": iteration,
+                "session_id": kw.get("session_id") or "",
+                "model": kw.get("model") or "",
+                "provider": kw.get("provider") or "",
+                "surface": kw.get("platform") or "",
+                "final_text": text_out,
+                "final_text_truncated": trunc,
+                "finished": True,
+                "error": None,
+                "delta_count": 0,
+                "text_chars": 0,
+                "reasoning_chars": 0,
+            })
         ev = {
             "event": "completion",
             "turn_id": turn_id,

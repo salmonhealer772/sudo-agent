@@ -265,10 +265,11 @@ for raw in sys.stdin:
     elif kind == "stream_end":
         end_run()
         err = ev.get("error")
-        out("%s└── end · finished=%s · deltas=%s · text=%sc · reasoning=%sc%s%s\n" % (
+        note = " · synthesized (this call did not stream)" if ev.get("synthesized") else ""
+        out("%s└── end · finished=%s · deltas=%s · text=%sc · reasoning=%sc%s%s%s\n" % (
             BOLD + CYAN, ev.get("finished"), ev.get("delta_count"),
             ev.get("text_chars"), ev.get("reasoning_chars"),
-            (" · error=" + str(err)) if err else "", OFF))
+            (" · error=" + str(err)) if err else "", note, OFF))
         turn_active = False
     elif kind == "completion":
         # Fired on EVERY finished API call. Only worth showing when that call
