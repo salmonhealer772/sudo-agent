@@ -90,7 +90,7 @@ namespace. Three consequences are load-bearing:
    than crashlooping. If the two fleets are ever to share one port, the Letta
    fleet is the one that must move — see the header of `kube-scripts/redis-up.sh`.
 
-## Design rule: token-level observability (read before touching the watch surface)
+## Design rule: whole-runtime observability (read before touching the watch surface)
 
 The observer sidecar can only report what the agent has **finished**: it polls
 `/opt/data/state.db`, and Hermes writes a `messages` row only when a message is
@@ -99,13 +99,15 @@ agent thinks, in real time" is impossible from the DB by construction — not a
 matter of polling faster.
 
 1. **The tap is a Hermes plugin, not a poller.** `kube-scripts/watch_plugin/`
-   registers callbacks on Hermes' native stream hooks
+   registers callbacks on Hermes' native hooks
    (`on_stream_start` / `on_stream_delta` / `on_stream_end` /
-   `pre_api_request` / `post_api_request`) and appends to
-   `<HERMES_HOME>/watch/stream.jsonl`. Deltas are true per-token chunks
-   (`kind: text|reasoning`), and `pre_api_request` hands over the full
-   sanitised request body — the exact context the model is about to think
-   against — on every API call.
+   `pre_api_request` / `post_api_request` / `pre_tool_call` /
+   `post_tool_call`) and appends to `<HERMES_HOME>/watch/stream.jsonl`.
+   Deltas are true per-token chunks (`kind: text|reasoning`), `pre_api_request`
+   hands over the full sanitised request body — the exact context the model is
+   about to think against — on every API call, and the tool hooks carry the
+   **FULL** arguments and **FULL** result body of every tool call. The tap is
+   deliberately the whole runtime, not a token lane.
 2. **Discovery and enablement are pinned.** A `standalone` plugin loads only
    when its key is in `plugins.enabled`; reasoning deltas only flow with
    `plugins.stream_reasoning_deltas: true`. `up.sh` therefore (a) ships the
@@ -127,11 +129,12 @@ matter of polling faster.
    fast and must never raise.
 4. **The deploy proves itself or fails.** After `kubectl apply`, `up.sh` waits
    for the rollout and then, inside the pod, asks Hermes' own plugin manager
-   how many callbacks are registered for `on_stream_delta` and
-   `pre_api_request`. Zero callbacks aborts the deploy loudly. A pod that
-   silently ships no token stream is the failure mode this rule exists to
-   prevent. (`SUDO_AGENT_SKIP_STREAM_PROBE=1` is the documented,
-   discouraged escape hatch.)
+   how many callbacks are registered for **all seven** hooks. Any hook
+   reporting zero aborts the deploy loudly and names it. A pod that silently
+   ships no stream — or worse, streams tokens while quietly dropping every
+   tool call — is the failure mode this rule exists to prevent.
+   (`SUDO_AGENT_SKIP_STREAM_PROBE=1` is the documented, discouraged escape
+   hatch.)
 5. **Rejected alternative: an on-wire SSE tap.** Tracing the provider
    connection would also give true token rate, but the watch container has NO
    effective capabilities (`CapEff: 0000000000000000`) so it cannot ptrace at
@@ -151,6 +154,31 @@ matter of polling faster.
    tail is preserved verbatim at `/events-stream`. Agents pick it up on their
    next `up.sh` roll — the surface is per-agent, so no fleet-wide cutover is
    needed (and none should be done without operator sign-off).
+8. **The log and the console are the SAME level of detail.** This is an
+   explicit, deliberate reversal of ordinary CLI taste, mandated by the
+   operator: *"THE ENTIRE AGENT RUNTIME FULLY STREAMED AND I WANT THE LOGGING
+   TO BE THE SAME LEVEL"* and *"i want the default view for stream.sh TO SHOW
+   LIVE AS MUCH DETAIL OF AGENT ACTIVITY AS CAN BE MONITORED … THE ENTIRE
+   AGENT."* Trimming is OPT-IN (`--no-logs`, `--no-activity`,
+   `?kinds=` on `/stream`); the default everywhere is everything. Do not
+   "tidy up" the default view — that is the product.
+9. **The screen is never silently frozen.** Hermes emits nothing while the
+   model generates tool-call arguments, while a tool runs, and while the
+   provider is thinking. A phase machine plus a watchdog in the plugin emit
+   `activity` beats on a bounded cadence (default 2 s) for the whole duration
+   of a turn, so the operator is never left staring at a screen wondering
+   whether the agent died. The measurable form of the rule lives in
+   `/status` → `stream.silent_for_s`.
+10. **Housekeeping is shown, not hidden.** cron / subagent / curator turns are
+    tagged `housekeeping: true` (filterable) but recorded AND rendered, unlike
+    `transcript.txt`, which suppresses them. The distinction is a
+    surface/platform heuristic — the raw `surface` rides on every event so a
+    consumer can re-classify — and that limitation is stated rather than
+    papered over.
+11. **The agent's own log lines are part of the feed.** `agent.log` and
+    `gateway.log` are mirrored into the tape from EOF, so errors, warnings and
+    retries appear next to the tokens that caused them instead of in a file
+    nobody is tailing.
 
 ## MCP Service
 

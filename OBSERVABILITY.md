@@ -25,8 +25,8 @@ to poll — per-token granularity is impossible from it by construction.
 | `/opt/data/watch/events.jsonl` | the tape — one JSON event per line (user / thinking / assistant / tool_call / tool_result / session / process_state) |
 | `/opt/data/watch/transcript.txt` | the product — human-readable chat log of REAL operator prompts and agent replies only |
 | `/opt/data/watch/state.json` | persisted cursors (messages.id AUTOINCREMENT into state.db; sessions.rowid) — restart-safe, NO backfill |
-| `/opt/data/watch/stream.jsonl` | **the token tape** — every reasoning/answer delta, every pre-request input context, every stream boundary, written by the plugin as it happens |
-| `/opt/data/watch/plugin.json` | the plugin's heartbeat (loaded, pid, hook list, per-event counters) — what `/status` uses to prove the tap is alive |
+| `/opt/data/watch/stream.jsonl` | **the whole-runtime tape** — every reasoning/answer delta, every pre-request input context, FULL tool calls + FULL tool results, the activity/liveness beats, housekeeping turns tagged, the mirrored agent log lines, and the stream boundaries, written by the plugin as it happens |
+| `/opt/data/watch/plugin.json` | the plugin's heartbeat (loaded, pid, hook list, per-event counters, current **phase**) — what `/status` uses to prove the tap is alive |
 | `/opt/data/plugins/sudo-watch-stream/` | the plugin itself (`plugin.yaml` + `__init__.py`), from the `sudo-<name>-watch-plugin` ConfigMap |
 
 `state.json` also carries `stream_offset`: the sidecar's byte cursor into
@@ -57,7 +57,9 @@ materializes on the first real prompt after the sidecar is deployed.
 ## Daily driver
 
 ```bash
-# LIVE TOKEN STREAM (default): every reasoning/answer chunk as the model emits it
+# THE FIREHOSE (default): the whole runtime, live — every reasoning/answer
+# chunk, FULL tool args and FULL tool results, activity beats, housekeeping
+# turns, and the agent's own log lines, all in one feed
 bash kube-scripts/stream.sh --<name>
 
 # only the model's reasoning/thinking
@@ -65,6 +67,10 @@ bash kube-scripts/stream.sh --<name> --thinking
 
 # only the answer text
 bash kube-scripts/stream.sh --<name> --answer
+
+# trim the two noisiest lanes (both are ON by default)
+bash kube-scripts/stream.sh --<name> --no-logs
+bash kube-scripts/stream.sh --<name> --no-activity
 
 # also dump the full input context (system prompt, user message, role/size table)
 bash kube-scripts/stream.sh --<name> --context
@@ -79,21 +85,53 @@ bash kube-scripts/stream.sh --<name> -t
 bash kube-scripts/stream.sh --list
 ```
 
-Token mode renders each turn as a block:
+Token mode renders each turn as a block — the console shows EVERYTHING the
+tape holds, at the same level of detail (that is the product, by operator
+request; trimming is opt-in):
 
 ```
 ┌── turn <turn id> · iter <api call #> · <model> (<provider>) · surface=cli · 12:03:44
 │ context: 27 msgs (system:1, user:12, assistant:14) · ~18422 tokens · 73381 chars · api_mode=chat_completions · call #6
+· 12:03:44 [activity] provider_wait · blocked on the provider (no first token yet) · in-phase 0.0s
 [think] we need to look at the config first …
+· 12:03:47 [activity] generating_text · generating answer text · in-phase 0.3s
 [reply] The fix is a per-agent mount, here is why …
+· 12:03:49 [activity] tool_running write_file · blocked inside a tool call · in-phase 0.0s
+├─ TOOL write_file (20091 chars of args) · 12:03:49
+{
+  "path": "/opt/data/x.txt",
+  "content": "…FULL argument text, untruncated…"
+}
+├─ RESULT write_file · ok · 123ms · 30011 chars
+…FULL result body, untruncated…
+· 12:03:51 [activity] tool_running write_file · blocked inside a tool call · in-phase 2.1s
 └── end · finished=True · deltas=412 · text=1183c · reasoning=2210c
+```
+
+```
+HOUSEKEEPING(cron) ┌── turn <turn id> · iter 1 · <model> (<provider>) · surface=cron · 12:10:00
+│  housekeeping turn (cron) — recorded AND shown, not suppressed
+HOUSEKEEPING(cron) │ context: 3 msgs (system:1, user:2) · ~900 tokens · 3000 chars · api_mode=chat_completions · call #1
+HOUSEKEEPING(cron) [non-streamed answer] nothing to do
 ```
 
 * `[think]` / `[reply]` mark the start of a run; chunks are appended
   **verbatim** — no 200-char truncation, no whitespace collapsing (the old
   event view did both, which made streamed text unreadable).
-* Colour (dim reasoning, green answer) only on a tty; `--no-color` forces
-  plain.
+* `├─ TOOL` prints the **FULL** arguments and `├─ RESULT` the **FULL** result
+  body. Nothing is truncated (set `SUDO_WATCH_TOOL_MAX_CHARS` inside the agent
+  only if some tool ever returns something pathological).
+* `· HH:MM:SS [activity] <phase> …` is the liveness beat. While a turn is in
+  flight the plugin re-emits the current phase at least every
+  `SUDO_WATCH_ACTIVITY_EVERY_SEC` (default 2 s) whenever nothing else is
+  flowing, so the screen is never silently frozen while the agent works.
+* Housekeeping turns (cron / subagent / curator) are prefixed
+  `HOUSEKEEPING(<reason>)` on every line — recorded AND shown.
+* `· HH:MM:SS [agent.log WARNING] …` mirrors the agent's own log lines, so
+  errors, warnings and retries appear in the same feed as the tokens
+  (`--no-logs` hides this lane).
+* Colour (dim reasoning, green answer, yellow beats/blocked, red errors) only
+  on a tty; `--no-color` forces plain.
 * A call that did not stream (provider without SSE, copilot-acp, a MoA facade
   with no consumers) shows `[non-streamed answer] <text>` when it completes —
   cron/subagent turns never stream silently into nothing.
@@ -124,16 +162,21 @@ curl http://sudo-<name>-watch:8000/status
 | `/ps` | JSON list of non-self processes in the pod |
 | `/events?n=100` | last N events verbatim (JSONL) |
 | `/events-stream` | *legacy*: backlog (last 20) + live tail of NEW events.jsonl lines |
-| `/stream?n=20&kinds=reasoning,text&since=<byte offset>` | **the token tape**: backlog (last N MATCHING stream.jsonl lines) + live tail of NEW ones |
+| `/stream?n=20&kinds=reasoning,text&since=<byte offset>` | **the whole-runtime stream**: backlog (last N MATCHING stream.jsonl lines) + live tail of NEW ones. **No `kinds` = EVERY line** (that is the default); `kinds` is an opt-in filter |
 
 Both tails write plain unframed bytes with `Connection: close` (no chunked
 encoding — that was a sudo-letta round-2 bug, fixed here from day one).
 
 `/stream` details:
 
-* `kinds=` filters on the delta kind for `delta` lines (`reasoning`, `text`)
-  and on the event name for every other line (`turn_start`, `input_context`,
-  `stream_end`, `completion`); `kinds=delta` selects every delta.
+* **The default is everything.** With no `kinds` parameter `/stream` serves
+  every line of the tape — tokens, `input_context`, `tool_call` / `tool_result`
+  (full bodies), `activity`, `log`, housekeeping-tagged turns, boundaries and
+  completions. Filtering is opt-in: `kinds=` selects on the delta kind for
+  `delta` lines (`reasoning`, `text`) and on the event name for every other
+  line (`turn_start`, `input_context`, `stream_end`, `completion`,
+  `tool_call`, `tool_result`, `activity`, `log`); `kinds=delta` selects every
+  delta.
 * The live tail starts at end-of-file. Pass `since=<offset>` (from
   `/status` → `stream.cursor_offset`) to resume exactly where the last
   consumer stopped; a bare `since=` implies `n=0`, so a resume never replays a
@@ -143,25 +186,34 @@ encoding — that was a sudo-letta round-2 bug, fixed here from day one).
 
 `/status` gained a `stream` block: `lines`, `bytes`, `cursor_offset`, per-kind
 counts, `last_delta_ts` / `delta_age_s`, `active_turn_id`, `text_chars`,
-`reasoning_chars`, `turns`, plus a `plugin` sub-block (`installed`, `loaded`,
-`pid`, `pid_alive`, `in_gateway`, `hooks_registered`, `counts`, `dropped`,
+`reasoning_chars`, `turns`, `last_activity_ts` / `activity_age_s` /
+`last_phase`, `last_tool_ts` / `tool_age_s`, `last_log_ts` / `log_age_s`,
+`housekeeping_turns`, and `silent_for_s` — how long since ANY tape line, which
+is the machine-readable form of the "never silent" contract — plus a `plugin`
+sub-block (`installed`, `loaded`, `pid`, `pid_alive`, `in_gateway`,
+`hooks_registered`, `phase`, `log_capture`, `counts`, `dropped`,
 `heartbeat_age_s`). `in_gateway` is the strong signal: the plugin's recorded
 pid is alive **and** its cmdline is the agent's `hermes gateway run` process
 (shared PID namespace), so a plugin loaded by a throwaway CLI probe cannot
 masquerade as the live tap.
 
-## Token-level stream — the sudo-watch-stream plugin
+## Whole-runtime stream — the sudo-watch-stream plugin
 
 `stream.jsonl`, one JSON object per line (all lines carry `ts` (epoch float)
-and a monotonic `seq`):
+and a monotonic `seq`). This is the WHOLE agent runtime, not just tokens — the
+tape and the console are deliberately the same level of detail:
 
 | event | source hook | fields |
 |---|---|---|
 | `plugin_state` | `register()` | state, hooks, log_dir, pid |
-| `turn_start` | `on_stream_start` | turn_id, iteration, session_id, model, provider, surface |
+| `turn_start` | `on_stream_start` | turn_id, iteration, session_id, model, provider, surface, **housekeeping**, **housekeeping_reason** |
 | `input_context` | `pre_api_request` | turn_id, api_call_count, api_request_id, session_id, model, provider, api_mode, platform, message_count, tool_count, approx_input_tokens, request_char_count, max_tokens, **messages** (role + chars + preview each), **request_body** (sanitised provider body, bounded), **system_prompt**, **user_message** |
 | `delta` | `on_stream_delta` | kind (`text` \| `reasoning`), delta (raw chunk), turn_id, iteration, text_chars, reasoning_chars |
-| `stream_end` | `on_stream_end` | final_text, finished, error, delta_count, text_chars, reasoning_chars; `synthesized: true` on a call that never streamed |
+| `tool_call` | `pre_tool_call` | tool, **args (FULL)**, args_chars, tool_call_id, turn_id, session_id, api_request_id, task_id |
+| `tool_result` | `post_tool_call` | tool, args, **result (FULL)**, result_chars, status, error_type, error_message, duration_ms, tool_call_id, turn_id, session_id |
+| `activity` | plugin watchdog + every phase transition | phase, reason, tool, phase_since, phase_elapsed, beat (`phase` \| `heartbeat` \| `idle`), idle_for |
+| `log` | plugin log mirror (agent.log / gateway.log) | stream, file, level, line |
+| `stream_end` | `on_stream_end` (or synthesized on a never-streamed call) | final_text, finished, error, delta_count, text_chars, reasoning_chars; `synthesized: true` on a call that never streamed |
 | `completion` | `post_api_request` | finish_reason, api_duration, usage, response_model, assistant_content_chars, assistant_tool_call_count, **streamed** (bool), text (only when nothing streamed) |
 
 A call that never streams (cron, subagent/delegated child, provider without
@@ -169,6 +221,51 @@ SSE) emits `input_context` + a `stream_end` marked `synthesized: true` with
 `delta_count: 0` + a `completion` with `streamed: false` and the finished
 text — measured on this fleet: cron and subagent turns do NOT stream, cli /
 gateway turns do.
+
+### The never-silent contract (`activity`)
+
+Hermes emits no text at all while the model is **generating tool-call
+arguments** (`_fire_tool_gen_started` — a real, otherwise-invisible gap),
+while a **tool is running**, and while the **provider** has not produced its
+first token. The plugin therefore keeps a phase machine
+
+```
+idle | turn_active | provider_wait | generating_reasoning | generating_text
+     | tool_args | tool_running | tool_result
+```
+
+driven by the hooks (`on_stream_start` -> turn_active, `pre_api_request` ->
+provider_wait, first `delta` -> generating_*, `post_api_request` with tool
+calls -> tool_args, `pre_tool_call` -> tool_running, `post_tool_call` ->
+tool_result, `on_stream_end` -> idle) and a **watchdog thread** that re-emits
+the current phase at least every `SUDO_WATCH_ACTIVITY_EVERY_SEC` (default 2 s)
+whenever no other tape line has been written in that window, plus a slow idle
+beat (`SUDO_WATCH_IDLE_EVERY_SEC`, default 30 s; 0 disables). Phase
+transitions always emit immediately. Long-lived phases back off to 15 s after
+300 beats so an abandoned turn cannot write forever.
+
+Measured consequence: while a turn is in flight the longest silent gap in the
+console is bounded by the cadence — `/status` → `stream.silent_for_s` reports
+it live.
+
+### Housekeeping turns (`housekeeping`)
+
+cron / subagent / curator (and any surface in
+`SUDO_WATCH_HOUSEKEEPING_SURFACES`) turns are tagged
+`housekeeping: true` + `housekeeping_reason` so a consumer CAN filter them —
+and they are still **recorded and shown**, unlike `transcript.txt`, which
+suppresses them. Detection is a surface/platform heuristic because Hermes does
+not label an auxiliary call as such at the hook boundary; the raw
+`surface`/`platform` ride on every event, so nothing is hidden behind the
+guess.
+
+### Agent log mirror (`log`)
+
+The plugin tails `<HERMES_HOME>/logs/agent.log` and `gateway.log` from EOF
+(no backfill — the same discipline as every other cursor here) and emits each
+line with its parsed level, so errors, warnings and retries land in the same
+feed as the tokens. `SUDO_WATCH_LOG_CAPTURE=0` disables it,
+`SUDO_WATCH_LOG_FILES` picks other files.
 
 Notes that matter operationally:
 
@@ -193,9 +290,14 @@ Notes that matter operationally:
   `sudo-<name>-watch-plugin` ConfigMap and mounted read-only into **both**
   containers.
 * **No silent fallback**: after every roll `up.sh` waits for the rollout, then
-  proves *inside the pod* that the hooks registered (`on_stream_delta` +
-  `pre_api_request` callbacks > 0, asked of Hermes' own plugin manager). Zero
-  callbacks = the deploy aborts loudly. Emergency-only escape hatch:
+  proves *inside the pod* that **all seven** hooks registered
+  (`on_stream_start`, `on_stream_delta`, `on_stream_end`, `pre_api_request`,
+  `post_api_request`, `pre_tool_call`, `post_tool_call` — each asked of
+  Hermes' own plugin manager via `iter_hook_callbacks`). Any hook reporting
+  zero callbacks = the deploy aborts loudly, naming the missing hooks. That
+  matters most for the tool lanes: a plugin that silently lost
+  `pre_tool_call`/`post_tool_call` would still stream tokens while quietly
+  dropping every tool call. Emergency-only escape hatch:
   `SUDO_AGENT_SKIP_STREAM_PROBE=1`.
 
 ## Event schema
@@ -316,10 +418,22 @@ id) are the authoritative one-at-a-time evidence — see the `results` array of
   interactive path, and it is the one `stream.sh` is built around. The direct
   (non-streaming) route here is Hermes' deliberate avoidance of a
   nested-thread deadlock for those contexts; the plugin reports the gap
-  instead of faking tokens.
+  instead of faking tokens. Even on those turns the `activity` watchdog keeps
+  emitting beats, so the console still shows the agent working.
 - The plugin is per-agent: an agent that has not been rolled still has no
   `stream.jsonl`, and `stream.sh` says so loudly rather than showing an empty
   screen.
+- `tool_call` / `tool_result` args and results are **untruncated by default**.
+  A tool that returns tens of megabytes will put tens of megabytes on one
+  `stream.jsonl` line; set `SUDO_WATCH_TOOL_MAX_CHARS` on the agent if that
+  ever becomes a problem (it sets `args_truncated` / `result_truncated`).
+- Housekeeping detection is a **heuristic** on `surface`/`platform`. A future
+  Hermes surface that is not an operator conversation but is not in
+  `SUDO_WATCH_HOUSEKEEPING_SURFACES` will be tagged as an operator turn (and
+  vice versa). The raw surface always rides on the event, so a consumer can
+  re-classify from the tape.
+- The log mirror starts at EOF: lines written before the plugin loaded are not
+  replayed (by design — same resume discipline as everything else here).
 - An on-wire SSE tap (tracing the provider connection) was rejected: the
   watch container has NO effective capabilities (`CapEff: 0`) so it cannot
   ptrace, and putting a tracer in the agent container would couple the
