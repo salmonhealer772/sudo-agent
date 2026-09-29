@@ -143,6 +143,39 @@ if [[ ! -f "$WATCH_SIDECAR" ]]; then
   exit 1
 fi
 
+# ── Token-level stream plugin (kube-scripts/watch_plugin/) ───────────────────
+# The sidecar alone cannot show a token before the model finishes it (state.db
+# only gets a row per COMPLETE message). The plugin is the real-time tap: it
+# hooks Hermes' native stream callbacks and appends every chunk to
+# /opt/data/watch/stream.jsonl. up.sh owns the whole wiring so a fresh agent
+# streams with no manual step:
+#   1. ship the plugin files in a ConfigMap mounted at the plugin dir that
+#      Hermes scans for user plugins (<HERMES_HOME>/plugins/<key>/);
+#   2. enable it in the per-agent config (plugins.enabled + reasoning deltas);
+#   3. AFTER the rollout, prove inside the pod that the hooks really
+#      registered — a deploy that silently ships no token stream is exactly
+#      the failure this repo refuses to accept.
+WATCH_PLUGIN_KEY="sudo-watch-stream"
+WATCH_PLUGIN_DIR="$SCRIPT_DIR/watch_plugin"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "✗ python3 is required to enable $WATCH_PLUGIN_KEY in $PER_AGENT_CONFIG" >&2
+  echo "  (kube-scripts/watch_plugin_enable.py). Install python3 and re-run." >&2
+  exit 1
+fi
+for _f in plugin.yaml __init__.py; do
+  if [[ ! -f "$WATCH_PLUGIN_DIR/$_f" ]]; then
+    echo "✗ Missing $WATCH_PLUGIN_DIR/$_f (the $WATCH_PLUGIN_KEY plugin)" >&2
+    echo "  The token-level stream.sh view would be dead without it. Aborted." >&2
+    exit 1
+  fi
+done
+echo "→ Enabling $WATCH_PLUGIN_KEY in $PER_AGENT_CONFIG..."
+if ! python3 "$SCRIPT_DIR/watch_plugin_enable.py" "$PER_AGENT_CONFIG" "$WATCH_PLUGIN_KEY"; then
+  echo "✗ FAILED to enable $WATCH_PLUGIN_KEY in $PER_AGENT_CONFIG." >&2
+  echo "  Fix the config (or the helper) and re-run: without the plugin's" >&2
+  echo "  stream hooks, stream.sh would tail a file that never appears." >&2
+  exit 1
+fi
 # ── Preserve operator-added env vars ─────────────────────────────────────────
 # up.sh REGENERATES this Deployment from the template below, so the live object
 # is REPLACED, not merged. Any env var an operator added to the running
@@ -247,6 +280,13 @@ $EXTRA_ENV
           mountPath: /opt/data
         - name: config
           mountPath: /opt/data/config.yaml
+        # Token-level stream plugin: Hermes scans <HERMES_HOME>/plugins/<key>/
+        # for user plugins and HERMES_HOME is /opt/data in this image, so the
+        # ConfigMap below lands exactly where discovery looks. Read-only — the
+        # plugin writes its tape to /opt/data/watch/stream.jsonl instead.
+        - name: watch-plugin
+          mountPath: /opt/data/plugins/$WATCH_PLUGIN_KEY
+          readOnly: true
         - name: docker-sock
           mountPath: /var/run/docker.sock
       # ── Observer sidecar container ────────────────────────────────────────
@@ -275,6 +315,12 @@ $EXTRA_ENV
           mountPath: /opt/data
         - name: watch-config
           mountPath: /opt/watch-sidecar
+        # Same plugin mount as the agent container: stream.sh's pre-flight
+        # guard and the sidecar's /status check the manifest here, so a missing
+        # plugin is a loud error rather than an empty screen.
+        - name: watch-plugin
+          mountPath: /opt/data/plugins/$WATCH_PLUGIN_KEY
+          readOnly: true
       volumes:
       - name: data
         persistentVolumeClaim:
@@ -290,6 +336,10 @@ $EXTRA_ENV
       - name: watch-config
         configMap:
           name: $DEPLOY-watch-config
+          defaultMode: 0755
+      - name: watch-plugin
+        configMap:
+          name: $DEPLOY-watch-plugin
           defaultMode: 0755
 ---
 # ── Observer sidecar (watch) ──────────────────────────────────────────────
@@ -314,8 +364,27 @@ $(sed 's/^/    /' "$WATCH_SIDECAR")
       "poll_interval_sec": 2,
       "log_dir": "/opt/data/watch",
       "db_path": "/opt/data/state.db",
+      "stream_file": "/opt/data/watch/stream.jsonl",
+      "plugin_dir": "/opt/data/plugins/$WATCH_PLUGIN_KEY",
       "noisy_sources": ["cron", "subagent"]
     }
+---
+# ── Token-level stream plugin (mounted into BOTH containers) ────────────────
+# The agent container loads it from /opt/data/plugins/$WATCH_PLUGIN_KEY (the
+# user plugin dir for HERMES_HOME=/opt/data); the watch container gets the same
+# path so stream.sh and /status can prove the plugin is really installed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: $DEPLOY-watch-plugin
+  labels:
+    app: sudo-agent
+    agent: $NAME
+data:
+  plugin.yaml: |
+$(sed 's/^/    /' "$WATCH_PLUGIN_DIR/plugin.yaml")
+  __init__.py: |
+$(sed 's/^/    /' "$WATCH_PLUGIN_DIR/__init__.py")
 ---
 apiVersion: v1
 kind: Service
@@ -470,6 +539,47 @@ if ! kubectl apply -f "$YAML" --validate=false; then
   exit 1
 fi
 
+# ── Prove the token-stream hooks actually registered ────────────────────────
+# Applying YAML is not evidence that the agent will stream anything. This runs
+# INSIDE the new pod and asks Hermes' own plugin manager how many callbacks are
+# registered for the stream hooks. 0 means the plugin was not discovered (wrong
+# path/ConfigMap) or not enabled (config), and the operator would have opened
+# stream.sh onto a file that never appears — the silent breakage this repo
+# refuses to ship. Runs as the hermes user so nothing here can leave root-owned
+# files in the agent's PVC.
+WATCH_PROBE='from hermes_cli import plugins as p
+p._ensure_plugins_discovered(force=True)
+d = len(p.iter_hook_callbacks("on_stream_delta"))
+a = len(p.iter_hook_callbacks("pre_api_request"))
+print("on_stream_delta=%d pre_api_request=%d" % (d, a))
+raise SystemExit(0 if (d > 0 and a > 0) else 3)'
+
+if [[ "${SUDO_AGENT_SKIP_STREAM_PROBE:-}" == "1" ]]; then
+  echo "⚠ SUDO_AGENT_SKIP_STREAM_PROBE=1 — NOT proving the $WATCH_PLUGIN_KEY stream hooks" >&2
+else
+  echo "→ Waiting for $DEPLOY rollout (then proving the stream hooks)..."
+  if ! kubectl rollout status "deploy/$DEPLOY" --timeout="${SUDO_AGENT_ROLLOUT_TIMEOUT:-300}s"; then
+    echo "✗ rollout did not complete for $DEPLOY — the token stream is UNVERIFIED." >&2
+    echo "  Check: kubectl describe deploy/$DEPLOY ; kubectl get pods" >&2
+    exit 1
+  fi
+  PROBE_CMD=(/opt/hermes/.venv/bin/python -c "$WATCH_PROBE")
+  if kubectl exec "deploy/$DEPLOY" -c sudo-agent -- runuser -u hermes -- true >/dev/null 2>&1; then
+    PROBE_CMD=(runuser -u hermes -- /opt/hermes/.venv/bin/python -c "$WATCH_PROBE")
+  fi
+  _probe_out="$(kubectl exec "deploy/$DEPLOY" -c sudo-agent -- "${PROBE_CMD[@]}" 2>&1)"
+  _probe_rc=$?
+  echo "   $WATCH_PLUGIN_KEY hooks: ${_probe_out##*$'\n'}"
+  if [[ $_probe_rc -ne 0 ]]; then
+    echo "✗ FATAL: $WATCH_PLUGIN_KEY did NOT register its stream hooks in $DEPLOY." >&2
+    echo "  probe said: $_probe_out" >&2
+    echo "  Check the $DEPLOY-watch-plugin ConfigMap, its mount at" >&2
+    echo "  /opt/data/plugins/$WATCH_PLUGIN_KEY, and plugins.enabled in $PER_AGENT_CONFIG." >&2
+    echo "  Override (leaves the token stream unverified): SUDO_AGENT_SKIP_STREAM_PROBE=1" >&2
+    exit 1
+  fi
+fi
+
 echo ""
 echo "✓ $DEPLOY deployed"
 echo "  Queue:  $REDIS_URL via shared sudo-agent-redis (one drain worker per pod)"
@@ -477,6 +587,7 @@ echo "  Talk:   kubectl exec -it deploy/$DEPLOY -- hermes"
 echo "  Shell:  kubectl exec -it deploy/$DEPLOY -- bash"
 echo "  MCP:    http://$DEPLOY-mcp:8000/mcp"
 echo "  Watch:  http://$DEPLOY-watch:8000/status  (also /ps /events /stream /healthz)"
-echo "  Stream: bash kube-scripts/stream.sh --$NAME  (-t for transcript)"
+echo "  Stream: bash kube-scripts/stream.sh --$NAME  (live tokens; --thinking /"
+echo "          --answer / --context / --events / -t for transcript)"
 echo "  Logs:   kubectl logs deploy/$DEPLOY -f"
 echo "  Stop:   bash kube-scripts/down.sh --$NAME"
