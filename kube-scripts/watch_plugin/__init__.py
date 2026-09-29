@@ -36,6 +36,15 @@ EVENT SCHEMA (all lines carry ``ts`` (epoch float) and a monotonic ``seq``)
                              api_duration, response_model, usage,
                              assistant_content_chars,
                              assistant_tool_call_count, streamed, text}
+  {"event": "tool_call",     tool, args (FULL, no truncation), args_chars,
+                             tool_call_id, turn_id, session_id,
+                             api_request_id, task_id}
+  {"event": "tool_result",   tool, args, result (FULL, no truncation),
+                             result_chars, status, error_type, error_message,
+                             duration_ms, tool_call_id, turn_id, session_id}
+  {"event": "activity",      phase, reason, tool, phase_since, phase_elapsed,
+                             beat: "phase"|"heartbeat"|"idle", idle_for}
+  {"event": "log",           stream ("agent.log"|"gateway.log"), level, line}
 
 ``completion`` exists for the paths that never stream (a provider that refuses
 SSE, copilot-acp, a MoA facade without consumers): ``pre_api_request`` and
@@ -44,6 +53,37 @@ context and, when nothing streamed, the finished answer text. Those calls also
 get a ``stream_end`` with ``synthesized: true`` and ``delta_count: 0``, so a
 consumer can close the turn it saw an ``input_context`` for (the runtime only
 fires ``on_stream_end`` on the streaming path).
+
+THE WHOLE RUNTIME, NOT JUST TOKENS
+----------------------------------
+The tape and the console carry the SAME level of detail. Verbose by default is
+the product here, not a bug. Beyond the tokens this tape records:
+
+* ``tool_call`` / ``tool_result`` from ``pre_tool_call`` / ``post_tool_call``,
+  with FULL arguments and FULL result bodies. Nothing is truncated by default;
+  ``SUDO_WATCH_TOOL_MAX_CHARS`` can impose a cap if an operator ever wants one.
+* ``activity`` — the liveness beats that close the "silently waiting" gap. The
+  model emits NO text at all while it is generating tool-call arguments (the
+  ``_fire_tool_gen_started`` window), while a tool is running, and while the
+  provider has not yet produced its first token. So the plugin keeps a phase
+  machine (idle / turn_active / provider_wait / generating_reasoning /
+  generating_text / tool_args / tool_running / tool_result) and a watchdog that
+  re-emits the current phase at least every ``SUDO_WATCH_ACTIVITY_EVERY_SEC``
+  (default 2 s) for as long as a turn is in flight, plus a slow idle beat
+  (``SUDO_WATCH_IDLE_EVERY_SEC``, default 30 s) so an armed-but-idle agent still
+  shows life. Phase transitions always emit immediately. The contract: from the
+  console alone the operator can never be left staring at a silent screen while
+  the agent is doing something.
+* ``housekeeping`` — cron / subagent / curator / auxiliary turns are RECORDED
+  and SHOWN, tagged ``housekeeping: true`` + ``housekeeping_reason`` so a
+  consumer can filter them, instead of being suppressed the way transcript.txt
+  suppresses them. Detection is a surface/platform heuristic
+  (``SUDO_WATCH_HOUSEKEEPING_SURFACES``) because Hermes does not label an
+  auxiliary call as such at the hook boundary; the raw ``surface``/``platform``
+  always ride on the event too, so nothing is hidden behind the guess.
+* ``log`` — the agent's own log files (``agent.log``, ``gateway.log``) are
+  mirrored in from EOF, so errors, warnings and retries appear in the same feed
+  as the tokens.
 
 HARD RULES (a plugin must never hurt the agent it observes)
 -----------------------------------------------------------
@@ -63,6 +103,13 @@ Config (env overrides, all optional):
   SUDO_WATCH_STREAM_DIR        default <HERMES_HOME>/watch  (== /opt/data/watch)
   SUDO_WATCH_CONTEXT_MAX_CHARS default 60000   (cap for one input_context)
   SUDO_WATCH_DELTA_MAX_CHARS   default 16384   (cap for one delta chunk)
+  SUDO_WATCH_ACTIVITY_EVERY_SEC default 2.0    (never-silent beat cadence)
+  SUDO_WATCH_IDLE_EVERY_SEC    default 30.0    (idle heartbeat; 0 disables)
+  SUDO_WATCH_TOOL_MAX_CHARS    default 0       (0 = FULL args/results)
+  SUDO_WATCH_LOG_CAPTURE       default 1       (mirror agent.log/gateway.log)
+  SUDO_WATCH_LOG_FILES         default agent.log,gateway.log
+  SUDO_WATCH_LOG_LINE_MAX_CHARS default 0      (0 = full log lines)
+  SUDO_WATCH_HOUSEKEEPING_SURFACES default cron,subagent,curator,...
 """
 
 from __future__ import annotations
@@ -71,6 +118,7 @@ import itertools
 import json
 import os
 import queue
+import re
 import threading
 import time
 
@@ -83,6 +131,36 @@ QUEUE_MAX = 20000
 STATE_EVERY_SEC = 2.0
 MAX_PREVIEW = 160
 MAX_MESSAGE_ENTRIES = 400
+
+# ── whole-runtime capture (the AMENDMENT: log == console level of detail) ──
+# ACTIVITY_EVERY_SEC is the never-silent contract: while a turn is in flight
+# the writer emits an ``activity`` beat at least this often, so the console can
+# never sit silent for longer than ~ACTIVITY_EVERY_SEC while the agent works.
+ACTIVITY_EVERY_SEC = float(os.environ.get("SUDO_WATCH_ACTIVITY_EVERY_SEC") or 2.0)
+# Slow idle heartbeat so an armed-but-quiet agent still shows signs of life.
+# 0 disables the idle beat.
+IDLE_EVERY_SEC = float(os.environ.get("SUDO_WATCH_IDLE_EVERY_SEC") or 30.0)
+# FULL tool args / results by default. A positive int bounds a pathological
+# body and sets the *_truncated flags on the event.
+TOOL_MAX_CHARS = int(os.environ.get("SUDO_WATCH_TOOL_MAX_CHARS") or 0)
+# Mirror the agent's own log files into the tape.
+LOG_CAPTURE = (os.environ.get("SUDO_WATCH_LOG_CAPTURE") or "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+LOG_TAIL_FILES = tuple(f.strip() for f in
+                       (os.environ.get("SUDO_WATCH_LOG_FILES")
+                        or "agent.log,gateway.log").split(",") if f.strip())
+LOG_LINE_MAX_CHARS = int(os.environ.get("SUDO_WATCH_LOG_LINE_MAX_CHARS") or 0)
+# Surfaces that are NOT an operator conversation. Heuristic by necessity; see
+# the module docstring. Override with a comma list in the env if the fleet
+# grows a new non-operator surface.
+HOUSEKEEPING_SURFACES = {"cron", "subagent", "curator", "aux", "auxiliary",
+                         "memory_review", "title_generation", "kanban"}
+_hk_env = os.environ.get("SUDO_WATCH_HOUSEKEEPING_SURFACES")
+if _hk_env:
+    HOUSEKEEPING_SURFACES = set(x.strip().lower() for x in _hk_env.split(",")
+                                if x.strip())
+_LOG_LEVEL_RE = re.compile(
+    r"\b(TRACE|DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\b")
 
 _seq = itertools.count(1)
 _queue: "queue.Queue[dict]" = queue.Queue(maxsize=QUEUE_MAX)
@@ -99,6 +177,13 @@ _state = {
     "last_event_ts": None,
     "active_turn_id": "",
     "turns": {},  # (turn_id, iteration) -> {"delta_count", "text_chars", "reasoning_chars"}
+    # activity / never-silent state (written by the hooks, read by the watchdog)
+    "phase": "idle",
+    "phase_since": None,
+    "phase_tool": "",
+    "phase_beats": 0,
+    "last_beat_ts": 0.0,
+    "hk": {"housekeeping": False, "reason": ""},
 }
 _LOG_DIR = ""
 
@@ -181,6 +266,217 @@ def _turn_fields(kw: dict) -> dict:
         "provider": kw.get("provider") or "",
         "surface": kw.get("surface") or "",
     }
+
+
+# ── housekeeping tagging (recorded AND shown, never suppressed) ───────────
+
+def _housekeeping_tag(surface="", platform=""):
+    """(bool, reason) for "this is a background turn, not the operator"."""
+    hay = ("%s %s" % (surface or "", platform or "")).lower()
+    for s in sorted(HOUSEKEEPING_SURFACES):
+        if s and s in hay:
+            return True, s
+    return False, ""
+
+
+def _hk_update(surface="", platform="") -> None:
+    hk, reason = _housekeeping_tag(surface, platform)
+    try:
+        with _state_lock:
+            _state["hk"] = {"housekeeping": hk, "reason": reason}
+    except Exception:
+        pass
+
+
+def _hk_fields() -> dict:
+    try:
+        with _state_lock:
+            hk = dict(_state["hk"])
+    except Exception:
+        return {"housekeeping": False, "housekeeping_reason": ""}
+    return {"housekeeping": bool(hk.get("housekeeping")),
+            "housekeeping_reason": hk.get("reason") or ""}
+
+
+# ── activity phase machine ────────────────────────────────────────────────
+
+_PHASE_REASON = {
+    "provider_wait": "blocked on the provider (no first token yet)",
+    "generating_reasoning": "generating reasoning",
+    "generating_text": "generating answer text",
+    "tool_args": "generating tool-call arguments",
+    "tool_running": "blocked inside a tool call",
+    "tool_result": "tool returned; the model is reading the result",
+    "turn_active": "turn in flight",
+    "idle": "idle",
+}
+
+
+def _set_phase(phase, tool="", **extra) -> None:
+    """Record a phase transition; emit the beat when it actually changed."""
+    try:
+        now = time.time()
+        with _state_lock:
+            changed = (_state["phase"] != phase
+                       or _state["phase_tool"] != (tool or ""))
+            _state["phase"] = phase
+            _state["phase_tool"] = tool or ""
+            if changed:
+                _state["phase_since"] = now
+                _state["phase_beats"] = 0
+                _state["last_beat_ts"] = now
+            since = _state["phase_since"] or now
+        if not changed:
+            return
+        ev = {"event": "activity", "phase": phase, "tool": tool or "",
+              "reason": _PHASE_REASON.get(phase, phase), "beat": "phase",
+              "phase_since": since,
+              "phase_elapsed": round(max(0.0, now - since), 3)}
+        ev.update(_hk_fields())
+        ev.update(extra or {})
+        _enqueue(ev)
+    except Exception:
+        _count("activity_errors")
+
+
+def _activity_loop() -> None:
+    """Re-emit the current phase so the screen is never silently frozen.
+
+    While a turn is in flight the beat cadence is ACTIVITY_EVERY_SEC; when idle
+    it slows to IDLE_EVERY_SEC. Beats are skipped when real events are already
+    flowing, so a token stream is not polluted with heartbeats — the watchdog
+    only speaks when the writer has been quiet.
+    """
+    while True:
+        try:
+            time.sleep(0.5)
+            now = time.time()
+            with _state_lock:
+                phase = _state["phase"]
+                tool = _state["phase_tool"]
+                since = _state["phase_since"] or now
+                last_event = _state["last_event_ts"] or 0.0
+                last_beat = _state["last_beat_ts"] or 0.0
+                beats = int(_state["phase_beats"] or 0)
+            idle = phase in ("idle", "", "turn_end")
+            period = IDLE_EVERY_SEC if idle else ACTIVITY_EVERY_SEC
+            if period <= 0:
+                continue
+            # back off a long-lived phase so an abandoned turn cannot write a
+            # beat line every 2 s forever
+            if not idle and beats > 300:
+                period = max(period, 15.0)
+            quiet_for = now - max(last_event, last_beat)
+            if quiet_for < period:
+                continue
+            with _state_lock:
+                _state["last_beat_ts"] = now
+                _state["phase_beats"] = int(_state["phase_beats"] or 0) + 1
+            ev = {"event": "activity", "phase": phase, "tool": tool,
+                  "reason": _PHASE_REASON.get(phase, phase),
+                  "beat": "idle" if idle else "heartbeat",
+                  "phase_since": since,
+                  "phase_elapsed": round(max(0.0, now - since), 3),
+                  "idle_for": (round(max(0.0, now - last_event), 3)
+                               if last_event else None)}
+            ev.update(_hk_fields())
+            _enqueue(ev)
+        except Exception:
+            _count("activity_errors")
+            time.sleep(0.5)
+
+
+# ── FULL-body serialisation (tool args / results, log lines) ─────────────
+
+def _full_json(value, cap=0):
+    """(jsonable_value, truncated). cap=0 means NO truncation (the default)."""
+    if value is None:
+        return None, False
+    if cap and cap > 0:
+        data, trunc, _text = _bound_json(value, cap)
+        return data, bool(trunc)
+    if isinstance(value, str):
+        return value, False
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str)), False
+    except Exception:
+        try:
+            return str(value), True
+        except Exception:
+            return None, True
+
+
+def _chars_of(value) -> int:
+    try:
+        if isinstance(value, str):
+            return len(value)
+        return len(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        return 0
+
+
+# ── the agent's own log files, mirrored in ────────────────────────────────
+
+def _log_candidates():
+    home = os.environ.get("HERMES_HOME") or DEFAULT_HOME
+    out = []
+    for name in LOG_TAIL_FILES:
+        path = name if os.path.isabs(name) else os.path.join(home, "logs", name)
+        out.append((name, path))
+    return out
+
+
+def _log_level(line: str) -> str:
+    try:
+        m = _LOG_LEVEL_RE.search(line[:220])
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def _logtail_loop() -> None:
+    """Mirror agent.log / gateway.log into the tape. No backfill: start at EOF."""
+    offsets = {}
+    while True:
+        try:
+            time.sleep(1.0)
+            for name, path in _log_candidates():
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                off = offsets.get(path)
+                if off is None:
+                    offsets[path] = size          # first sight: start at EOF
+                    continue
+                if size < off:                     # rotated/truncated
+                    off = 0
+                if size <= off:
+                    continue
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(off)
+                        data = f.read()
+                except OSError:
+                    continue
+                if not data:
+                    continue
+                nl = data.rfind(b"\n")
+                if nl < 0:
+                    continue                       # half-written line; wait
+                chunk, _rest = data[:nl + 1], data[nl + 1:]
+                offsets[path] = off + len(chunk)
+                for raw in chunk.splitlines():
+                    line = raw.decode("utf-8", "replace")
+                    if not line.strip():
+                        continue
+                    if LOG_LINE_MAX_CHARS and len(line) > LOG_LINE_MAX_CHARS:
+                        line = line[:LOG_LINE_MAX_CHARS] + "\u2026[truncated]"
+                    _enqueue({"event": "log", "stream": name, "file": path,
+                              "level": _log_level(line), "line": line})
+        except Exception:
+            _count("logtail_errors")
+            time.sleep(1.0)
 
 
 # ── bounding helpers (JSON stays VALID, size stays bounded) ───────────────
@@ -332,6 +628,10 @@ def _write_state() -> None:
                 "dropped": int(_state["dropped"]),
                 "last_event_ts": _state["last_event_ts"],
                 "active_turn_id": _state["active_turn_id"],
+                "phase": _state["phase"],
+                "phase_since": _state["phase_since"],
+                "last_beat_ts": _state["last_beat_ts"],
+                "log_capture": LOG_CAPTURE,
                 "stream_file": stream_path(),
                 "ts": time.time(),
             }
@@ -404,14 +704,80 @@ def _start() -> None:
     t = threading.Thread(target=_writer, name="sudo-watch-stream-writer",
                          daemon=True)
     t.start()
+    t = threading.Thread(target=_activity_loop,
+                         name="sudo-watch-stream-activity", daemon=True)
+    t.start()
+    if LOG_CAPTURE:
+        t = threading.Thread(target=_logtail_loop,
+                             name="sudo-watch-stream-logtail", daemon=True)
+        t.start()
 
 
 # ── hook callbacks (all must be fast and must never raise) ────────────────
+#
+# Cost rule: a pre_* hook fires INLINE on the agent's own path (pre_tool_call on
+# the tool path, pre_api_request on the request path), so every callback here
+# does the minimum — build a small dict and queue it. All serialisation and
+# file I/O happen on the writer thread. Every callback is wrapped and never
+# raises into the agent; pre_tool_call returns None (observer only, never a
+# block/approve/modify directive).
+
+def _tool_fields(kw: dict) -> dict:
+    return {
+        "tool_call_id": kw.get("tool_call_id") or "",
+        "turn_id": kw.get("turn_id") or "",
+        "session_id": kw.get("session_id") or "",
+        "api_request_id": kw.get("api_request_id") or "",
+        "task_id": kw.get("task_id") or "",
+    }
+
+
+def _on_tool_call_start(**kw) -> None:
+    """pre_tool_call — FULL tool arguments, the moment the tool is dispatched."""
+    try:
+        name = kw.get("tool_name") or kw.get("name") or ""
+        args, trunc = _full_json(kw.get("args"), TOOL_MAX_CHARS)
+        fields = _tool_fields(kw)
+        _set_phase("tool_running", tool=name, **fields)
+        _enqueue(dict({"event": "tool_call", "tool": name, "name": name,
+                       "args": args, "args_truncated": trunc,
+                       "args_chars": _chars_of(args)},
+                      **fields, **_hk_fields()))
+    except Exception:
+        _count("errors")
+    return None
+
+
+def _on_tool_call_end(**kw) -> None:
+    """post_tool_call — FULL result body, status, error, duration."""
+    try:
+        name = kw.get("tool_name") or kw.get("name") or ""
+        args, args_trunc = _full_json(kw.get("args"), TOOL_MAX_CHARS)
+        result, res_trunc = _full_json(kw.get("result"), TOOL_MAX_CHARS)
+        fields = _tool_fields(kw)
+        _set_phase("tool_result", tool=name, **fields)
+        _enqueue(dict({
+            "event": "tool_result", "tool": name, "name": name,
+            "args": args, "result": result,
+            "args_truncated": args_trunc, "result_truncated": res_trunc,
+            "args_chars": _chars_of(args), "result_chars": _chars_of(result),
+            "status": kw.get("status"),
+            "error_type": kw.get("error_type"),
+            "error_message": kw.get("error_message") or "",
+            "duration_ms": kw.get("duration_ms"),
+        }, **fields, **_hk_fields()))
+    except Exception:
+        _count("errors")
+
 
 def _on_stream_start(**kw) -> None:
     try:
         fields = _turn_fields(kw)
-        _enqueue(dict({"event": "turn_start"}, **fields))
+        _hk_update(surface=fields.get("surface"))
+        with _state_lock:
+            _state["active_turn_id"] = fields["turn_id"]
+        _set_phase("turn_active", **fields)
+        _enqueue(dict({"event": "turn_start"}, **fields, **_hk_fields()))
     except Exception:
         _count("errors")
 
@@ -421,9 +787,10 @@ def _on_stream_delta(delta="", kind="text", **kw) -> None:
         if not isinstance(delta, str) or not delta:
             return
         if len(delta) > DELTA_MAX_CHARS:
-            delta = delta[:DELTA_MAX_CHARS] + "…[truncated]"
+            delta = delta[:DELTA_MAX_CHARS] + "\u2026[truncated]"
         kind = kind if kind in ("text", "reasoning") else "text"
         fields = _turn_fields(kw)
+        _hk_update(surface=fields.get("surface"))
         key = _turn_key(fields["turn_id"], fields["iteration"])
         with _state_lock:
             turn = _state["turns"].setdefault(
@@ -438,8 +805,11 @@ def _on_stream_delta(delta="", kind="text", **kw) -> None:
                     _state["turns"].pop(old, None)
             tc = turn["text_chars"]
             rc = turn["reasoning_chars"]
+        _set_phase("generating_reasoning" if kind == "reasoning"
+                   else "generating_text", **fields)
         ev = dict({"event": "delta", "kind": kind, "delta": delta,
-                   "text_chars": tc, "reasoning_chars": rc}, **fields)
+                   "text_chars": tc, "reasoning_chars": rc},
+                  **fields, **_hk_fields())
         _enqueue(ev)
     except Exception:
         _count("errors")
@@ -448,6 +818,7 @@ def _on_stream_delta(delta="", kind="text", **kw) -> None:
 def _on_stream_end(final_text="", finished=True, error=None, **kw) -> None:
     try:
         fields = _turn_fields(kw)
+        _hk_update(surface=fields.get("surface"))
         key = _turn_key(fields["turn_id"], fields["iteration"])
         with _state_lock:
             turn = dict(_state["turns"].get(key)
@@ -456,7 +827,7 @@ def _on_stream_end(final_text="", finished=True, error=None, **kw) -> None:
         text = final_text if isinstance(final_text, str) else ""
         trunc = len(text) > CONTEXT_MAX_CHARS
         if trunc:
-            text = text[:CONTEXT_MAX_CHARS] + "…[truncated]"
+            text = text[:CONTEXT_MAX_CHARS] + "\u2026[truncated]"
         ev = dict({
             "event": "stream_end",
             "final_text": text,
@@ -466,8 +837,11 @@ def _on_stream_end(final_text="", finished=True, error=None, **kw) -> None:
             "delta_count": turn["delta_count"],
             "text_chars": turn["text_chars"],
             "reasoning_chars": turn["reasoning_chars"],
-        }, **fields)
+        }, **fields, **_hk_fields())
         _enqueue(ev)
+        _set_phase("idle")
+        with _state_lock:
+            _state["active_turn_id"] = ""
     except Exception:
         _count("errors")
 
@@ -475,7 +849,16 @@ def _on_stream_end(final_text="", finished=True, error=None, **kw) -> None:
 def _on_pre_api_request(**kw) -> None:
     """Request path: build references only, never serialise here."""
     try:
-        _enqueue({
+        surface = kw.get("surface") or ""
+        platform = kw.get("platform") or ""
+        _hk_update(surface=surface, platform=platform)
+        _set_phase("provider_wait",
+                   turn_id=kw.get("turn_id") or "",
+                   session_id=kw.get("session_id") or "",
+                   model=kw.get("model") or "",
+                   provider=kw.get("provider") or "",
+                   surface=surface or platform)
+        _enqueue(dict({
             "event": "input_context",
             "turn_id": kw.get("turn_id") or "",
             "api_call_count": kw.get("api_call_count"),
@@ -485,7 +868,7 @@ def _on_pre_api_request(**kw) -> None:
             "model": kw.get("model") or "",
             "provider": kw.get("provider") or "",
             "api_mode": kw.get("api_mode") or "",
-            "platform": kw.get("platform") or "",
+            "platform": platform,
             "message_count": kw.get("message_count"),
             "tool_count": kw.get("tool_count"),
             "approx_input_tokens": kw.get("approx_input_tokens"),
@@ -499,7 +882,7 @@ def _on_pre_api_request(**kw) -> None:
                 "request_messages": kw.get("request_messages"),
                 "conversation_history": kw.get("conversation_history"),
             },
-        })
+        }, **_hk_fields()))
     except Exception:
         _count("errors")
 
@@ -526,7 +909,7 @@ def _on_post_api_request(**kw) -> None:
             text_out, trunc = "", False
         else:
             trunc = len(text) > CONTEXT_MAX_CHARS
-            text_out = (text[:CONTEXT_MAX_CHARS] + "…[truncated]") if trunc else text
+            text_out = (text[:CONTEXT_MAX_CHARS] + "\u2026[truncated]") if trunc else text
 
         usage, _t, _s = _bound_json(kw.get("usage"), 2000)
         if not streamed:
@@ -535,7 +918,7 @@ def _on_post_api_request(**kw) -> None:
             # synthesised: the runtime fires on_stream_end only on the
             # streaming path, and a consumer must be able to close the turn it
             # saw an input_context for. delta_count 0 = nothing streamed.
-            _enqueue({
+            _enqueue(dict({
                 "event": "stream_end",
                 "synthesized": True,
                 "turn_id": turn_id,
@@ -551,8 +934,17 @@ def _on_post_api_request(**kw) -> None:
                 "delta_count": 0,
                 "text_chars": 0,
                 "reasoning_chars": 0,
-            })
-        ev = {
+            }, **_hk_fields()))
+        n_tools = kw.get("assistant_tool_call_count")
+        try:
+            n_tools_i = int(n_tools or 0)
+        except Exception:
+            n_tools_i = 0
+        _set_phase("tool_args" if n_tools_i > 0 else "idle",
+                   turn_id=turn_id, session_id=kw.get("session_id") or "",
+                   model=kw.get("model") or "", provider=kw.get("provider") or "",
+                   surface=kw.get("platform") or "")
+        ev = dict({
             "event": "completion",
             "turn_id": turn_id,
             "iteration": iteration,
@@ -571,7 +963,7 @@ def _on_post_api_request(**kw) -> None:
             "streamed": streamed,
             "text": text_out,
             "text_truncated": trunc,
-        }
+        }, **_hk_fields())
         _enqueue(ev)
     except Exception:
         _count("errors")
@@ -580,11 +972,12 @@ def _on_post_api_request(**kw) -> None:
 # ── plugin entry point ────────────────────────────────────────────────────
 
 HOOKS = ("on_stream_start", "on_stream_delta", "on_stream_end",
-         "pre_api_request", "post_api_request")
+         "pre_api_request", "post_api_request",
+         "pre_tool_call", "post_tool_call")
 
 
 def register(ctx) -> None:
-    """Hermes plugin entry point: start the writer, register the stream hooks."""
+    """Hermes plugin entry point: start the writers, register every hook."""
     try:
         _start()
         ctx.register_hook("on_stream_start", _on_stream_start)
@@ -592,6 +985,8 @@ def register(ctx) -> None:
         ctx.register_hook("on_stream_end", _on_stream_end)
         ctx.register_hook("pre_api_request", _on_pre_api_request)
         ctx.register_hook("post_api_request", _on_post_api_request)
+        ctx.register_hook("pre_tool_call", _on_tool_call_start)
+        ctx.register_hook("post_tool_call", _on_tool_call_end)
         with _state_lock:
             _state["loaded"] = True
             _state["pid"] = os.getpid()

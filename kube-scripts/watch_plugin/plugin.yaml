@@ -1,6 +1,6 @@
 name: sudo-watch-stream
-version: "1.0.0"
-description: "Token-level live streaming tap for sudo-agent pods: writes every reasoning/answer delta, the pre-request input context it is about to send, and the stream boundaries to <HERMES_HOME>/watch/stream.jsonl so the watch sidecar can tail it live. Observer-only, stdlib-only, never raises into the agent."
+version: "1.1.0"
+description: "Whole-runtime live streaming tap for sudo-agent pods: every reasoning/answer delta, the full pre-request input context, FULL tool arguments and FULL tool results, liveness/activity beats that guarantee the console is never silently frozen, housekeeping (cron/subagent/curator) turns tagged instead of suppressed, and the agent's own log lines mirrored in — all appended to <HERMES_HOME>/watch/stream.jsonl so the watch sidecar can tail it live. Observer-only, stdlib-only, never raises into the agent."
 author: sudo-agent-maintainer
 kind: standalone
 hooks:
@@ -9,3 +9,5 @@ hooks:
   - on_stream_end
   - pre_api_request
   - post_api_request
+  - pre_tool_call
+  - post_tool_call
