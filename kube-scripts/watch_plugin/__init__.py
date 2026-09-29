@@ -321,6 +321,16 @@ def _set_phase(phase, tool="", **extra) -> None:
                        or _state["phase_tool"] != (tool or ""))
             _state["phase"] = phase
             _state["phase_tool"] = tool or ""
+            # Refresh the ACTIVE TURN from any hook that knows it. A turn spans
+            # several API calls — on_stream_end fires per API CALL, not per turn
+            # — so the id has to survive the mid-turn stream ends. Without this
+            # the watchdog beats come out with turn_id "" and the beats that
+            # carry a long/blocking tool call cannot be attributed to the turn
+            # they belong to (measured: five consecutive ~2s
+            # "blocked inside a tool call" beats, all turn_id "").
+            tid = extra.get("turn_id")
+            if tid:
+                _state["active_turn_id"] = tid
             if changed:
                 _state["phase_since"] = now
                 _state["phase_beats"] = 0
@@ -842,8 +852,14 @@ def _on_stream_end(final_text="", finished=True, error=None, **kw) -> None:
         }, **fields, **_hk_fields())
         _enqueue(ev)
         _set_phase("idle")
-        with _state_lock:
-            _state["active_turn_id"] = ""
+        # NOTE: the active turn id is deliberately NOT cleared here.
+        # on_stream_end marks the end of ONE API CALL, not of the turn: a
+        # tool-calling turn continues with further iterations, and clearing the
+        # id here made every watchdog beat after the first iteration carry
+        # turn_id "" (measured: the "blocked inside a tool call" beats that
+        # cover a 12-second tool call were unattributable). The id is
+        # overwritten by the next turn's on_stream_start / pre_api_request, and
+        # once the turn really is over the beats say phase:"idle" + idle_for.
     except Exception:
         _count("errors")
 

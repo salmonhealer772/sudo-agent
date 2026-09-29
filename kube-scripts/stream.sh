@@ -35,6 +35,19 @@
 #   Trim with --no-logs / --no-activity, or use --transcript for the clean
 #   digest. Trimming is opt-in; verbose is the default.
 #
+# THE LIVE LANE IS CHECKED AGAINST THE MODEL'S OWN TEXT
+#   The token lane is Hermes' DISPLAY stream; stream_end.final_text is the text
+#   the model actually assembled. They can differ, so at every stream end the
+#   two are compared and the console says which case it is:
+#     * Hermes' own display-only paragraph break after a tool iteration ->
+#       nothing said (that is normal, not a loss);
+#     * line breaks differ but the text is identical -> one "live lane
+#       reflowed" note, with both newline counts. Measured on a headless
+#       `hermes -z` run: 58 newlines streamed vs 120 in final_text;
+#     * anything more -> the authoritative text is printed in full, labelled,
+#       because a console that quietly shows less than the model produced is
+#       the one failure mode this view must never have.
+#
 # WHERE THE TOKENS COME FROM
 #   The watch sidecar alone cannot do this: it polls state.db, and Hermes only
 #   writes a row there when a message is COMPLETE. Everything above is written
@@ -170,6 +183,7 @@ if [ "$MODE" = "tokens" ]; then
 cat > "$FILTER" <<'PYEOF'
 import json
 import os
+import re
 import sys
 import time
 
@@ -199,6 +213,92 @@ def out(s):
 last_run = None          # "reasoning" | "text" | None — for run prefixes
 turn_active = False
 turn_hk = False          # is the turn we are inside a housekeeping turn?
+
+# ── live-lane vs authoritative-text reconciliation ─────────────────────────
+# The token lane is Hermes' DISPLAY stream; stream_end.final_text is the text
+# the model actually assembled. They are NOT always the same, and pretending
+# otherwise would let the console quietly under-report the answer:
+#   * Hermes prepends a display-only "\n\n" paragraph break to the first text
+#     delta after a tool iteration (run_agent._fire_stream_delta), so a small
+#     difference is normal — reporting that as a loss would be noise on every
+#     tool-calling turn;
+#   * on a headless run (`hermes -z`, no display callback registered) Hermes
+#     lstrips leading newlines from EVERY delta, so line breaks that open a
+#     chunk are dropped and the answer runs together (measured on this agent:
+#     58 newlines streamed vs 120 in final_text).
+# So: identical -> say nothing; equal once whitespace is ignored -> one line
+# saying the lane was reflowed; anything else (the live lane really is missing
+# content) -> print the authoritative text, labelled. The operator is never
+# shown less than the model produced, and never spammed for a display break.
+turn_text = {}           # (turn_id, iteration) -> [text chunks]
+turn_text_len = {}       # (turn_id, iteration) -> total chars
+turn_text_capped = set()  # turns too big to compare (we say so instead of lying)
+TURN_TEXT_MAX = 2000000
+
+
+def _key(ev):
+    return (ev.get("turn_id") or "", ev.get("iteration"))
+
+
+def _note_turn_text(ev):
+    """Accumulate this turn's text deltas so stream_end can be checked."""
+    try:
+        k = _key(ev)
+        d = ev.get("delta") or ""
+        if _key(ev) in turn_text_capped:
+            return
+        if turn_text_len.get(k, 0) + len(d) > TURN_TEXT_MAX:
+            turn_text_capped.add(k)
+            return
+        turn_text.setdefault(k, []).append(d)
+        turn_text_len[k] = turn_text_len.get(k, 0) + len(d)
+        if len(turn_text) > 64:                      # bound the bookkeeping
+            for old in list(turn_text)[:16]:
+                turn_text.pop(old, None)
+                turn_text_len.pop(old, None)
+    except Exception:
+        pass
+
+
+def _reconcile(ev):
+    """Compare what the console streamed with stream_end.final_text."""
+    try:
+        k = _key(ev)
+        chunks = turn_text.pop(k, None)
+        turn_text_len.pop(k, None)
+        capped = k in turn_text_capped
+        turn_text_capped.discard(k)
+        # A synthesized stream_end is the boundary for a call that never
+        # streamed (cron / subagent / no-SSE provider): there are no deltas BY
+        # CONSTRUCTION, and the answer is already shown by the `completion`
+        # branch. Comparing here would double-print it.
+        if ev.get("synthesized"):
+            return
+        final = ev.get("final_text")
+        if not isinstance(final, str) or capped:
+            if capped:
+                out("%s\u2502 note: %s chars of live text were not retained for "
+                    "comparison (too large); the token lane is still verbatim "
+                    "and final_text below/above is authoritative%s\n"
+                    % (DIM, TURN_TEXT_MAX, OFF))
+            return
+        streamed = "".join(chunks or [])
+        if streamed == final:
+            return
+        body = streamed[2:] if streamed.startswith("\n\n") else streamed
+        if body == final:
+            return              # only Hermes' documented display paragraph break
+        if re.sub(r"\s+", "", body) == re.sub(r"\s+", "", final):
+            out("%s\u2502 note: live lane reflowed by Hermes - line breaks differ "
+                "from the assembled answer (%d vs %d newlines); no text lost%s\n"
+                % (DIM, body.count("\n"), final.count("\n"), OFF))
+            return
+        out("%s%s\u2502 AUTHORITATIVE TEXT - the live lane differed from "
+            "stream_end.final_text by more than whitespace; this is the model's "
+            "actual answer (%d chars)%s\n" % (BOLD, YELLOW, len(final), OFF))
+        out(final if final.endswith("\n") else final + "\n")
+    except Exception:
+        pass
 
 def stamp(ts):
     try:
@@ -298,6 +398,10 @@ for raw in sys.stdin:
                 DIM, ev.get("file") or "stream.jsonl", OFF))
     elif kind == "delta":
         dkind = ev.get("kind") or "text"
+        # Accumulate BEFORE any display filter: the fidelity check compares the
+        # whole text lane, not just the part this invocation is showing.
+        if dkind == "text":
+            _note_turn_text(ev)
         if only_thinking and dkind != "reasoning":
             continue
         if only_answer and dkind != "text":
@@ -348,6 +452,11 @@ for raw in sys.stdin:
             ev.get("text_chars"), ev.get("reasoning_chars"),
             (" \u00b7 error=" + str(err)) if err else "", note, OFF))
         turn_active = False
+        # Prove the live lane against the model's assembled text (see
+        # _reconcile). Skipped in --thinking mode, where the answer is not
+        # being shown at all.
+        if not only_thinking:
+            _reconcile(ev)
     elif kind == "completion":
         # Fired on EVERY finished API call. Only worth showing when that call
         # did not stream — that is the cron/subagent/provider-fallback case

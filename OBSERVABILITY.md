@@ -246,7 +246,16 @@ transitions always emit immediately. Long-lived phases back off to 15 s after
 
 Measured consequence: while a turn is in flight the longest silent gap in the
 console is bounded by the cadence — `/status` → `stream.silent_for_s` reports
-it live.
+it live. Measured on a single 84 s turn (long reasoning, a 12 s blocking tool
+call, a ~6 kB answer): **longest silent gap 2.39 s**, and it fell on the
+second heartbeat *inside* the 12 s tool call.
+
+Every `activity` beat carries the `turn_id` it belongs to, watchdog beats
+included. A turn spans several API calls, so the turn id is refreshed by every
+hook that knows it and is **not** cleared at each `on_stream_end` (that hook
+fires per API CALL, not per turn). Before that fix the beats covering the 12 s
+tool call came out with `turn_id: ""` and could not be attributed to the turn
+they belonged to.
 
 ### Housekeeping turns (`housekeeping`)
 
@@ -423,6 +432,24 @@ id) are the authoritative one-at-a-time evidence — see the `results` array of
 - The plugin is per-agent: an agent that has not been rolled still has no
   `stream.jsonl`, and `stream.sh` says so loudly rather than showing an empty
   screen.
+- **The token lane is Hermes' DISPLAY stream, and Hermes can reflow it.** Two
+  measured differences from `stream_end.final_text` (the text the model
+  actually assembled): Hermes prepends a display-only `"\n\n"` paragraph break
+  to the first text delta after a tool iteration, and on a headless run
+  (`hermes -z`, where no display callback is registered) it lstrips leading
+  newlines from *every* delta, so line breaks that open a chunk are dropped and
+  the live answer runs together (measured: 58 newlines streamed vs 120 in
+  `final_text` for one long markdown answer).
+  The observer itself truncates and collapses nothing — proven by comparing the
+  plugin's own hook-time `delta_count` against the delta lines on the tape
+  (equal for every stream end measured). `stream.sh` compensates at each
+  `stream_end`: silence when they match, one "live lane reflowed" note with
+  both newline counts when they differ only in whitespace, and the
+  **authoritative text printed in full** if the live lane is missing actual
+  content. `final_text` is always on the tape and is the text to trust.
+- An interrupt mid-stream (`hermes -z` killed, container restart) leaves the
+  turn with no `stream_end` at all — the tape simply stops. That is the honest
+  representation of a killed turn; nothing synthesises a fake ending.
 - `tool_call` / `tool_result` args and results are **untruncated by default**.
   A tool that returns tens of megabytes will put tens of megabytes on one
   `stream.jsonl` line; set `SUDO_WATCH_TOOL_MAX_CHARS` on the agent if that
