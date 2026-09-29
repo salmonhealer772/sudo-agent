@@ -39,9 +39,22 @@ Three jobs in one process (threads):
       GET /status       -> JSON snapshot
       GET /ps           -> JSON list of non-self processes
       GET /events?n=100 -> last N event lines verbatim (JSONL)
-      GET /stream       -> backlog dump + live tail of NEW events (plain
-                          unframed stream, Connection: close; client
-                          disconnect closes the socket)
+      GET /events-stream -> backlog dump + live tail of NEW EVENTS (the
+                          original /stream behaviour, preserved verbatim)
+      GET /stream?n=20&kinds=reasoning,text&since=<byte offset>
+                       -> the TOKEN-LEVEL stream written by the
+                          sudo-watch-stream plugin (<log_dir>/stream.jsonl):
+                          backlog (last N MATCHING lines, default 20) + live
+                          tail of NEW stream lines. `kinds` filters on the
+                          delta kind for delta lines and on the event name for
+                          every other line; `since` resumes the live tail at an
+                          exact byte offset instead of EOF. There is no
+                          stream.jsonl until the plugin is loaded and a turn
+                          runs, so this replies 404 with a clear message
+                          instead of an empty 200.
+
+   Plain unframed bytes with Connection: close (no chunked encoding) on both
+   tails; client disconnects close the socket immediately.
 
 Event schema — one JSON object per line in ``<log_dir>/events.jsonl``:
 
@@ -72,6 +85,7 @@ import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import socket
+from urllib.parse import parse_qs, urlsplit
 
 # ── Config ────────────────────────────────────────────────────────────────
 
@@ -87,6 +101,12 @@ DEFAULTS = {
     # sessions with a source in this set are treated as machine self-prompts
     # (reminder:true -> excluded from the transcript)
     "noisy_sources": ["cron", "subagent"],
+    # ── Token-level stream tap (written by kube-scripts/watch_plugin/) ──────
+    # The plugin is the only writer of stream.jsonl; the sidecar follows it
+    # with its own persisted byte cursor (never backfills, exactly like the
+    # messages.id cursor) to keep live stats for /status and to serve /stream.
+    "stream_file": "",                       # default: <log_dir>/stream.jsonl
+    "plugin_dir": "/opt/data/plugins/sudo-watch-stream",
 }
 
 CONFIG = dict(DEFAULTS)
@@ -99,8 +119,27 @@ STATE = {
     "active": False,
     "last_process_state": None,  # "active" | "idle"
     "last_transcript_conv": None,  # conversation of the last transcript line
+    # token stream (stream.jsonl) — updated by stream_tap_loop
+    "stream": {
+        "lines": 0,               # lines consumed since this sidecar started
+        "bytes": 0,               # size of stream.jsonl at last poll
+        "kinds": {},              # event/kind -> count
+        "last_ts": None,          # ts of the last stream line consumed
+        "last_delta_ts": None,    # ts of the last delta (token) consumed
+        "last_delta_kind": None,  # "text" | "reasoning"
+        "text_chars": 0,
+        "reasoning_chars": 0,
+        "active_turn_id": "",
+        "turns": 0,
+    },
 }
 _LOCK = threading.Lock()  # guards events.jsonl appends + STATE counters
+
+# One shared cursor map + ONE writer: the capture thread persists state.json,
+# the stream thread only marks keys dirty (they must never clobber each other).
+_WM_LOCK = threading.Lock()
+_WM = {}
+_WM_DIRTY = False
 
 
 def load_config():
@@ -123,6 +162,10 @@ def load_config():
         cfg["log_dir"] = os.environ["WATCH_LOG_DIR"]
     if os.environ.get("WATCH_DB"):
         cfg["db_path"] = os.environ["WATCH_DB"]
+    if os.environ.get("WATCH_STREAM_FILE"):
+        cfg["stream_file"] = os.environ["WATCH_STREAM_FILE"]
+    if os.environ.get("WATCH_PLUGIN_DIR"):
+        cfg["plugin_dir"] = os.environ["WATCH_PLUGIN_DIR"]
     CONFIG.clear()
     CONFIG.update(cfg)
 
@@ -137,6 +180,21 @@ def transcript_path():
 
 def state_path():
     return os.path.join(CONFIG["log_dir"], "state.json")
+
+
+def stream_path():
+    """The plugin's token-level tape (see kube-scripts/watch_plugin/)."""
+    return CONFIG["stream_file"] or os.path.join(CONFIG["log_dir"],
+                                                 "stream.jsonl")
+
+
+def plugin_state_path():
+    """plugin.json written by the plugin (its own liveness heartbeat)."""
+    return os.path.join(CONFIG["log_dir"], "plugin.json")
+
+
+def plugin_manifest_path():
+    return os.path.join(CONFIG["plugin_dir"], "plugin.yaml")
 
 
 def ensure_log_dir():
@@ -197,16 +255,144 @@ def load_watermarks():
     """Persisted cursors: {'last_message_id': N, 'last_session_rowid': N}."""
     try:
         with open(state_path()) as f:
-            return json.load(f)
+            loaded = json.load(f)
     except (OSError, ValueError):
-        return {}
+        loaded = {}
+    with _WM_LOCK:
+        _WM.clear()
+        _WM.update(loaded if isinstance(loaded, dict) else {})
+        return _WM
 
 
-def save_watermarks(wm):
-    tmp = state_path() + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(wm, f)
-    os.replace(tmp, state_path())
+def mark_watermark(key, value):
+    """Record one cursor value; the capture thread performs the flush."""
+    global _WM_DIRTY
+    with _WM_LOCK:
+        if _WM.get(key) != value:
+            _WM[key] = value
+            _WM_DIRTY = True
+
+
+def save_watermarks_if_dirty():
+    """Single writer for state.json (capture thread only)."""
+    global _WM_DIRTY
+    with _WM_LOCK:
+        if not _WM_DIRTY:
+            return
+        snapshot = dict(_WM)
+        _WM_DIRTY = False
+    try:
+        tmp = state_path() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp, state_path())
+    except OSError:
+        with _WM_LOCK:
+            _WM_DIRTY = True
+
+
+# ── Token-level stream tap (stream.jsonl, written by the plugin) ───────────
+
+def _stream_kind_of(ev):
+    """Filtering key for one stream line: delta kind, else the event name."""
+    if ev.get("event") == "delta":
+        return ev.get("kind") or "text"
+    return ev.get("event") or "?"
+
+
+def _line_matches(raw, kinds):
+    """Does a raw stream.jsonl line pass the ?kinds= filter?
+
+    ``kinds=reasoning,text`` selects delta lines by kind; any event name
+    (``turn_start``, ``input_context``, ``stream_end``, ``completion`` ...)
+    selects that event; ``delta`` selects every delta line. An empty filter
+    matches everything, and an unparsable line is passed through rather than
+    silently dropped (never hide data because it confused us).
+    """
+    if not kinds:
+        return True
+    try:
+        ev = json.loads(raw.decode("utf-8", "replace")
+                        if isinstance(raw, (bytes, bytearray)) else raw)
+    except ValueError:
+        return True
+    if not isinstance(ev, dict):
+        return True
+    if ev.get("event") == "delta":
+        return ("delta" in kinds
+                or (ev.get("kind") or "text").lower() in kinds)
+    return (ev.get("event") or "?").lower() in kinds
+
+
+def _stream_tap_once():
+    """Consume new stream.jsonl lines from the persisted byte cursor.
+
+    No backfill: on the very first pass the cursor is seeded to the CURRENT
+    end-of-file, so only lines written after the sidecar started are counted
+    (identical semantics to the messages.id seed in capture_once).
+    """
+    path = stream_path()
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return  # plugin not loaded / no turn yet
+    st = STATE["stream"]
+    st["bytes"] = size
+    with _WM_LOCK:
+        off = _WM.get("stream_offset")
+    if off is None:
+        mark_watermark("stream_offset", size)
+        return
+    if size < off:  # rotated or truncated: restart, never re-read gaps
+        off = 0
+    if size <= off:
+        return
+    consumed = off
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    break  # half-written line: wait for the writer's flush
+                consumed += len(raw)
+                try:
+                    ev = json.loads(raw.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                key = _stream_kind_of(ev)
+                st["lines"] += 1
+                st["kinds"][key] = st["kinds"].get(key, 0) + 1
+                ts = ev.get("ts")
+                if ts is not None:
+                    st["last_ts"] = ts
+                if ev.get("event") == "delta":
+                    st["last_delta_ts"] = ts
+                    st["last_delta_kind"] = key
+                    n = len(ev.get("delta") or "")
+                    if key == "reasoning":
+                        st["reasoning_chars"] += n
+                    else:
+                        st["text_chars"] += n
+                if ev.get("event") in ("turn_start", "input_context", "delta"):
+                    if ev.get("turn_id"):
+                        st["active_turn_id"] = ev["turn_id"]
+                if ev.get("event") == "turn_start":
+                    st["turns"] += 1
+    except OSError:
+        return
+    if consumed != off:
+        mark_watermark("stream_offset", consumed)
+
+
+def stream_tap_loop():
+    while True:
+        try:
+            _stream_tap_once()
+        except Exception:
+            pass  # stats only; never let the tap kill the sidecar
+        time.sleep(0.5)
 
 
 def _connect_ro():
@@ -377,8 +563,9 @@ def capture_loop():
     wm = load_watermarks()
     while True:
         changed = capture_once(wm)
-        if changed:
-            save_watermarks(wm)
+        for key, value in (changed or {}).items():
+            mark_watermark(key, value)
+        save_watermarks_if_dirty()
         time.sleep(0.5)
 
 
@@ -477,6 +664,84 @@ def _file_size(path):
         return 0
 
 
+def _plugin_status():
+    """What the sidecar can actually prove about the streaming plugin.
+
+    ``installed`` = the manifest is on disk (ConfigMap mounted by up.sh);
+    ``loaded``    = the plugin's register() actually ran (plugin.json, written
+                    by the plugin itself);
+    ``in_gateway``= that pid is ALIVE and its cmdline is the agent's gateway
+                    process — the shared PID namespace makes this checkable,
+                    which is why a plugin loaded by a throwaway CLI probe does
+                    not masquerade as the live tap.
+    """
+    info = {
+        "installed": os.path.isfile(plugin_manifest_path()),
+        "manifest": plugin_manifest_path(),
+        "state_file": plugin_state_path(),
+        "loaded": False,
+        "pid": None,
+        "pid_alive": False,
+        "in_gateway": False,
+        "hooks_registered": [],
+        "counts": {},
+        "dropped": 0,
+        "heartbeat_ts": None,
+        "heartbeat_age_s": None,
+    }
+    try:
+        with open(plugin_state_path()) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = None
+    if isinstance(st, dict):
+        info["loaded"] = bool(st.get("loaded"))
+        info["hooks_registered"] = list(st.get("hooks") or [])
+        info["counts"] = dict(st.get("counts") or {})
+        info["dropped"] = st.get("dropped") or 0
+        pid = st.get("pid")
+        info["pid"] = pid
+        ts = st.get("ts")
+        if isinstance(ts, (int, float)):
+            info["heartbeat_ts"] = ts
+            info["heartbeat_age_s"] = round(time.time() - ts, 1)
+        if isinstance(pid, int):
+            info["pid_alive"] = os.path.exists("/proc/%d" % pid)
+            if info["pid_alive"]:
+                cmd = _read_file("/proc/%d/cmdline" % pid).replace("\0", " ")
+                info["pid_cmdline"] = cmd.strip()[:200]
+                info["in_gateway"] = "gateway" in cmd and "hermes" in cmd.lower()
+    return info
+
+
+def _stream_status():
+    """Live stats for the token-level tape (updated by stream_tap_loop)."""
+    st = STATE["stream"]
+    path = stream_path()
+    now = time.time()
+    out = {
+        "file": path,
+        "exists": os.path.isfile(path),
+        "bytes": st["bytes"],
+        "lines": st["lines"],
+        "kinds": dict(st["kinds"]),
+        "last_ts": st["last_ts"],
+        "last_delta_ts": st["last_delta_ts"],
+        "last_delta_kind": st["last_delta_kind"],
+        "text_chars": st["text_chars"],
+        "reasoning_chars": st["reasoning_chars"],
+        "active_turn_id": st["active_turn_id"],
+        "turns": st["turns"],
+        "plugin": _plugin_status(),
+    }
+    for key, name in (("last_ts", "age_s"), ("last_delta_ts", "delta_age_s")):
+        ts = out[key]
+        out[name] = round(now - ts, 1) if isinstance(ts, (int, float)) else None
+    with _WM_LOCK:
+        out["cursor_offset"] = _WM.get("stream_offset")
+    return out
+
+
 # ── HTTP tap ──────────────────────────────────────────────────────────────
 
 class TapHandler(BaseHTTPRequestHandler):
@@ -513,6 +778,7 @@ class TapHandler(BaseHTTPRequestHandler):
                 "events_logged": STATE["events_logged"],
                 "transcript_bytes": _file_size(transcript_path()),
                 "watch_port": CONFIG["watch_port"],
+                "stream": _stream_status(),
             })
         elif path == "/ps":
             _, _, procs = poll_processes()
@@ -534,12 +800,24 @@ class TapHandler(BaseHTTPRequestHandler):
             self._send(200, "".join(lines[-n:]), "application/x-ndjson")
         elif path == "/stream":
             self.stream()
+        elif path == "/events-stream":
+            self.events_stream()
         else:
             self._send(404, "not found\n")
 
     def stream(self, backlog=20):
-        """Live tail of events.jsonl: dump the last ``backlog`` events (so the
-        operator sees the recent session immediately), then follow NEW events.
+        """Live token stream: backlog dump + follow NEW stream.jsonl lines.
+
+        Query params (all optional):
+          ?n=<N>          backlog: the last N MATCHING lines (default 20, 0 to
+                          skip; capped read window of the last 4 MB)
+          ?kinds=a,b      filter: delta kind ("reasoning"/"text") for delta
+                          lines, event name for every other line
+          ?since=<offset> live-follow from this BYTE OFFSET instead of EOF
+                          (the sidecar's own cursor is in /status ->
+                          stream.cursor_offset, so a consumer can resume
+                          exactly where the last one stopped; a bare ?since=
+                          implies n=0 so a resume never replays a backlog)
 
         Carried over from the sudo-letta round-2 fixes (operator-reported
         bugs, do not relearn):
@@ -551,6 +829,108 @@ class TapHandler(BaseHTTPRequestHandler):
           means the client is gone (e.g. Ctrl-C on curl); we catch it and close
           the socket immediately so no handler thread spins forever and no
           error spam piles up.
+        """
+        self.close_connection = True  # one request per connection; no keepalive
+        params = parse_qs(urlsplit(self.path).query)
+        # An explicit resume (?since=) means "carry on from there": do not also
+        # dump a default backlog, which would replay lines the caller already
+        # consumed. Ask for both explicitly to get backlog + resume.
+        default_backlog = 0 if ("since" in params and "n" not in params) else backlog
+        try:
+            backlog = max(0, int((params.get("n") or [default_backlog])[0]))
+        except (TypeError, ValueError):
+            backlog = 0
+        kinds = set()
+        for raw in params.get("kinds", []):
+            for part in str(raw).split(","):
+                part = part.strip().lower()
+                if part:
+                    kinds.add(part)
+        try:
+            since = int((params.get("since") or [""])[0])
+        except (TypeError, ValueError):
+            since = None
+        path = stream_path()
+        try:
+            f = open(path, "rb")
+        except OSError:
+            self._send(404, "no stream.jsonl yet (%s) — the sudo-watch-stream "
+                            "plugin is not loaded, or no turn has run on this "
+                            "agent yet\n" % path)
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            size = f.seek(0, 2)
+            if backlog and size:
+                start = max(0, size - 4 * 1024 * 1024)
+                f.seek(start)
+                if start:
+                    f.readline()  # drop the partial line at the window edge
+                selected = [ln for ln in f.readlines()
+                            if _line_matches(ln, kinds)]
+                for line in selected[-backlog:]:
+                    self.wfile.write(line)
+                self.wfile.flush()
+            if since is not None:
+                pos = min(max(0, since), size)
+            else:
+                pos = size  # live-follow: only NEW lines from here
+            # Follow by re-opening at our own byte position each pass instead
+            # of holding one handle at EOF: that is immune to any stale-EOF
+            # buffering and picks up rotation/truncation for free. The `tail
+            # -f` semantics are unchanged — only bytes we have not sent.
+            while True:
+                moved = False
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    time.sleep(0.25)
+                    continue
+                if size < pos:  # rotated/truncated: restart the follow
+                    pos = 0
+                if size > pos:
+                    with open(path, "rb") as follow:
+                        follow.seek(pos)
+                        for line in follow:
+                            if not line.endswith(b"\n"):
+                                break  # half-written line; wait for the flush
+                            pos += len(line)
+                            moved = True
+                            if _line_matches(line, kinds):
+                                self.wfile.write(line)
+                                self.wfile.flush()
+                if not moved:
+                    time.sleep(0.25)
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError, OSError):
+            pass  # client went away; fall through to cleanup
+        finally:
+            try:
+                f.close()
+            except OSError:
+                pass
+            # close the socket no matter how we got out, so the server thread
+            # and the kernel connection are reclaimed immediately
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+
+
+    def events_stream(self, backlog=20):
+        """Live tail of events.jsonl — the ORIGINAL /stream behaviour.
+
+        Kept verbatim (now served at /events-stream) so the state.db-derived
+        event tape keeps its old consumer contract while /stream became the
+        token-level tape. Same unframed-bytes / Connection: close / instant
+        client-disconnect handling as :meth:`stream`.
         """
         self.close_connection = True  # one request per connection; no keepalive
         try:
@@ -601,6 +981,7 @@ def main():
     os.makedirs(CONFIG["log_dir"], exist_ok=True)
     threads = [
         threading.Thread(target=capture_loop, daemon=True),
+        threading.Thread(target=stream_tap_loop, daemon=True),
         threading.Thread(target=monitor_loop, daemon=True),
         threading.Thread(target=http_server, daemon=True),
     ]
