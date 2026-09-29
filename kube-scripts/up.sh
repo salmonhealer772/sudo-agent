@@ -7,11 +7,13 @@ set -uo pipefail
 NAME=""
 KEY=""
 SUDO_PASS=""
+GLIMOR_DIR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --name|--*)  NAME="${1#--}"; shift ;;
-    *)           echo "Usage: bash kube-scripts/up.sh --name" >&2; exit 1 ;;
+    --from-glimor) GLIMOR_DIR="$2"; shift 2 ;;
+    --name|--*)    NAME="${1#--}"; shift ;;
+    *)             echo "Usage: bash kube-scripts/up.sh --name [--from-glimor <dir>]" >&2; exit 1 ;;
   esac
 done
 
@@ -274,6 +276,38 @@ if [[ "$_HD_BACKTICKS" -ne 0 || "$_HD_SUBS" -ne "$_HD_KNOWN_SUBS" ]]; then
   exit 1
 fi
 echo "→ Writing $YAML..."
+# ── Optional glimor seed (initContainer seeds the PVC BEFORE the agent runs) ──
+# When --from-glimor <dir> is given, an initContainer copies <dir>/hermes/ into
+# /opt/data BEFORE the Hermes process starts, so a fork wakes as the seeded
+# agent (never a blank Hermes). Idempotent: a .glimor-seeded marker skips
+# re-seeding on restarts (preserving the fork's runtime changes). A missing or
+# invalid glimor fails the initContainer (and the deploy) loudly.
+SEED_INITCONTAINERS=""
+SEED_VOLUME=""
+if [[ -n "${GLIMOR_DIR:-}" ]]; then
+  if [[ ! -d "$GLIMOR_DIR/hermes" ]] || [[ ! -f "$GLIMOR_DIR/hermes/SOUL.md" ]]; then
+    echo "✗ --from-glimor $GLIMOR_DIR: missing hermes/ or hermes/SOUL.md (a valid Hermes glimor needs both)" >&2
+    exit 1
+  fi
+  GLIMOR_ABS="$(cd "$GLIMOR_DIR" && pwd)"
+  SEED_INITCONTAINERS="      initContainers:
+      - name: seed-glimor
+        image: sudo-agent:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 0
+        command: [\"sh\", \"-c\", \"if test -f /opt/data/.glimor-seeded; then exit 0; fi; if ! test -d /seed/hermes; then exit 1; fi; if ! test -f /seed/hermes/SOUL.md; then exit 1; fi; cp -a /seed/hermes/. /opt/data/ && chown -R 10000:10000 /opt/data && touch /opt/data/.glimor-seeded\"]
+        volumeMounts:
+        - name: data
+          mountPath: /opt/data
+        - name: seed
+          mountPath: /seed
+          readOnly: true"
+  SEED_VOLUME="      - name: seed
+        hostPath:
+          path: $GLIMOR_ABS
+          type: Directory"
+fi
 cat > "$YAML" <<YAMLEOF
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -328,6 +362,7 @@ spec:
     spec:
       shareProcessNamespace: true
       hostNetwork: true
+$SEED_INITCONTAINERS
       containers:
       - name: sudo-agent
         image: sudo-agent:latest
@@ -407,6 +442,7 @@ $EXTRA_ENV
       - name: data
         persistentVolumeClaim:
           claimName: $DEPLOY-data
+$SEED_VOLUME
       - name: config
         hostPath:
           path: $PER_AGENT_CONFIG
