@@ -549,10 +549,15 @@ fi
 # files in the agent's PVC.
 WATCH_PROBE='from hermes_cli import plugins as p
 p._ensure_plugins_discovered(force=True)
-d = len(p.iter_hook_callbacks("on_stream_delta"))
-a = len(p.iter_hook_callbacks("pre_api_request"))
-print("on_stream_delta=%d pre_api_request=%d" % (d, a))
-raise SystemExit(0 if (d > 0 and a > 0) else 3)'
+want = ["on_stream_start", "on_stream_delta", "on_stream_end",
+        "pre_api_request", "post_api_request",
+        "pre_tool_call", "post_tool_call"]
+counts = {h: len(p.iter_hook_callbacks(h)) for h in want}
+missing = [h for h in want if counts[h] < 1]
+print(" ".join("%s=%d" % (h, counts[h]) for h in want))
+if missing:
+    print("MISSING: " + ",".join(missing))
+raise SystemExit(0 if not missing else 3)'
 
 if [[ "${SUDO_AGENT_SKIP_STREAM_PROBE:-}" == "1" ]]; then
   echo "⚠ SUDO_AGENT_SKIP_STREAM_PROBE=1 — NOT proving the $WATCH_PLUGIN_KEY stream hooks" >&2
@@ -571,11 +576,15 @@ else
   _probe_rc=$?
   echo "   $WATCH_PLUGIN_KEY hooks: ${_probe_out##*$'\n'}"
   if [[ $_probe_rc -ne 0 ]]; then
-    echo "✗ FATAL: $WATCH_PLUGIN_KEY did NOT register its stream hooks in $DEPLOY." >&2
+    echo "✗ FATAL: $WATCH_PLUGIN_KEY did NOT register its whole-runtime hooks in $DEPLOY." >&2
     echo "  probe said: $_probe_out" >&2
+    echo "  Every hook in the list above must report >=1 callback: the token lanes" >&2
+    echo "  (on_stream_*), the input context / completion (pre|post_api_request) and" >&2
+    echo "  the tool lanes (pre|post_tool_call). A missing tool hook means stream.sh" >&2
+    echo "  would silently lose tool calls and their FULL results." >&2
     echo "  Check the $DEPLOY-watch-plugin ConfigMap, its mount at" >&2
     echo "  /opt/data/plugins/$WATCH_PLUGIN_KEY, and plugins.enabled in $PER_AGENT_CONFIG." >&2
-    echo "  Override (leaves the token stream unverified): SUDO_AGENT_SKIP_STREAM_PROBE=1" >&2
+    echo "  Override (leaves the stream unverified): SUDO_AGENT_SKIP_STREAM_PROBE=1" >&2
     exit 1
   fi
 fi
@@ -587,7 +596,9 @@ echo "  Talk:   kubectl exec -it deploy/$DEPLOY -- hermes"
 echo "  Shell:  kubectl exec -it deploy/$DEPLOY -- bash"
 echo "  MCP:    http://$DEPLOY-mcp:8000/mcp"
 echo "  Watch:  http://$DEPLOY-watch:8000/status  (also /ps /events /stream /healthz)"
-echo "  Stream: bash kube-scripts/stream.sh --$NAME  (live tokens; --thinking /"
-echo "          --answer / --context / --events / -t for transcript)"
+echo "  Stream: bash kube-scripts/stream.sh --$NAME  (the WHOLE runtime, live:"
+echo "          tokens + FULL tool calls/results + activity beats + housekeeping"
+echo "          turns + the agent log; --no-logs / --no-activity to trim,"
+echo "          -t/--transcript for the clean digest)"
 echo "  Logs:   kubectl logs deploy/$DEPLOY -f"
 echo "  Stop:   bash kube-scripts/down.sh --$NAME"
