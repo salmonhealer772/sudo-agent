@@ -225,6 +225,54 @@ if [[ -n "$EXTRA_ENV" ]]; then
 fi
 
 # ── Generate YAML ──
+# ── Heredoc expansion guard ─────────────────────────────────────────────────
+# The manifest below is an UNQUOTED heredoc, so bash performs command
+# substitution over its ENTIRE body — including the YAML comments. It is thus
+# possible, and it has happened, to write a comment that the shell silently
+# EXECUTES: the annotation comment here previously contained an unescaped
+# backtick-quoted kubectl invocation, so every single deploy ran kubectl,
+# failed, and substituted the empty result into the manifest while printing
+# the useless "must specify one of -f and -k" line. The manifest still
+# parsed, so nothing ever failed — a real apply error would have been lost in
+# a line operators had been trained to ignore.
+#
+# So the body is scanned before it is used. Exactly two things may appear:
+#   * the THREE $(sed 's/^/    /' ...) indent helpers that embed the ConfigMap
+#     payloads (no more, no fewer — a new one is either a mistake or needs a
+#     deliberate update here);
+#   * plain $VAR references (DEPLOY, NAME, ports, digest, ...).
+# Any backtick that is not backslash-escaped, or any extra command
+# substitution, aborts before anything is written. No silent fallback: if the
+# boundaries cannot be found, we refuse to deploy.
+_HEREDOC_OPEN='cat > "$YAML" <<YAMLEOF'
+_HEREDOC_CLOSE='YAMLEOF'
+_HD_START="$(awk -v open="$_HEREDOC_OPEN" '$0 == open {print NR; exit}' "$0")"
+_HD_END="$(awk -v s="${_HD_START:-0}" -v endmark="$_HEREDOC_CLOSE" 'NR > s && $0 == endmark {print NR; exit}' "$0")"
+if [[ -z "$_HD_START" || -z "$_HD_END" ]]; then
+  echo "✗ FATAL: could not locate the manifest heredoc in $0 (open='$_HEREDOC_OPEN'," >&2
+  echo "  close='$_HEREDOC_CLOSE'). The expansion guard cannot run, so this deploy" >&2
+  echo "  would be unverified. Refusing to continue." >&2
+  exit 1
+fi
+_HD_BODY="$(awk -v s="$_HD_START" -v e="$_HD_END" 'NR > s && NR < e' "$0")"
+# 1) every backtick must be backslash-escaped: drop the escaped pairs, and
+#    anything still holding a backtick is a command the shell would RUN.
+_HD_BACKTICKS="$(printf '%s\n' "$_HD_BODY" | sed 's/\\`//g' | grep -c '`' || true)"
+# 2) the only command substitutions allowed are the three sed indent helpers.
+#    An ESCAPED \$( is inert (it renders as literal text and never runs), so
+#    it is removed before counting — that is what lets these comments document
+#    the hazard without tripping the guard.
+_HD_SUBS="$(printf '%s\n' "$_HD_BODY" | sed 's/\\\$[(]//g' \
+             | grep -o '\$(' | wc -l | tr -d ' ')"
+_HD_KNOWN_SUBS=3
+if [[ "$_HD_BACKTICKS" -ne 0 || "$_HD_SUBS" -ne "$_HD_KNOWN_SUBS" ]]; then
+  echo "✗ FATAL: the manifest heredoc in $0 contains a command the shell would" >&2
+  echo "  EXECUTE on every deploy (unescaped backticks: $_HD_BACKTICKS; command" >&2
+  echo "  substitutions: $_HD_SUBS, expected $_HD_KNOWN_SUBS)." >&2
+  echo "  Escape backticks as \\\` and keep \$() to the sed indent helpers." >&2
+  echo "  Nothing was written; the deploy did not start." >&2
+  exit 1
+fi
 echo "→ Writing $YAML..."
 cat > "$YAML" <<YAMLEOF
 apiVersion: v1
@@ -262,9 +310,20 @@ spec:
       annotations:
         # Digest of the ConfigMap-shipped watch scripts (sidecar + plugin).
         # Bumping it forces a new pod, which is the ONLY way a changed script
-        # takes effect: `kubectl apply` does not roll a Deployment for a
+        # takes effect: kubectl apply does not roll a Deployment for a
         # ConfigMap edit, and a live process keeps the module it already
         # imported. See the digest note in up.sh.
+        #
+        # NOTE: this heredoc is UNQUOTED, so bash expands \$(...) and
+        # \`backticks\` ANYWHERE in the body — including inside these YAML
+        # comments. That is not theoretical: a previous revision of this
+        # comment read \`kubectl apply\` unescaped, so every deploy actually
+        # RAN kubectl (with no -f/-k) and printed
+        #     error: must specify one of -f and -k
+        # into the deploy output, training everyone to ignore the one line a
+        # real apply failure would also produce. Backticks here MUST stay
+        # backslash-escaped; the manifest self-check after the heredoc is the
+        # backstop that catches it if someone forgets.
         sudo-agent/watch-scripts-sha: "$WATCH_SCRIPTS_SHA"
     spec:
       shareProcessNamespace: true
@@ -450,6 +509,51 @@ YAMLEOF
 if [[ ! -s "$YAML" ]]; then
   echo "✗ Failed to write $YAML" >&2; exit 1
 fi
+
+# ── Structural self-check on the generated manifest ─────────────────────────
+# The manifest is built by an UNQUOTED heredoc, so bash expands command
+# substitutions and backticks anywhere in its body — INCLUDING inside the YAML
+# comments. That is how the spurious "error: must specify one of -f and -k"
+# got into every deploy's output: a comment containing an unescaped
+# kubectl-backtick pair was executed as a command substitution on every run and
+# its (failed) output silently substituted into the file. The manifest stayed
+# loadable, so nothing ever failed — which is precisely the danger: the real
+# apply error would have been buried in a line operators had learned to ignore.
+# Escaping is the fix; this check is the backstop. It refuses to hand a
+# MANGLED manifest to `kubectl apply`, so a future stray substitution (or a
+# failed `sed` emitting the embedded ConfigMap sources) aborts the deploy
+# loudly instead of shipping a pod whose sidecar/plugin files are empty.
+_manifest_check() {
+  local missing=() kind n
+  for kind in PersistentVolumeClaim Deployment; do
+    grep -qx "kind: ${kind}" "$YAML" || missing+=("kind: ${kind}")
+  done
+  for kind in ConfigMap Service; do
+    n="$(grep -cx "kind: ${kind}" "$YAML" || true)"
+    [[ "${n:-0}" -eq 2 ]] || missing+=("2x kind: ${kind} (found ${n:-0})")
+  done
+  # The ConfigMap payloads are produced by `sed` command substitutions: if one
+  # of those fails, bash substitutes an empty string and the pod would mount an
+  # empty sidecar/plugin. Prove the bodies are really there.
+  local pat
+  for pat in 'watch_sidecar.py: |' 'plugin.yaml: |' '__init__.py: |' \
+             '"stream_file"' "sudo-agent/watch-scripts-sha: \"$WATCH_SCRIPTS_SHA\"" \
+             "hostPath:" "claimName: $DEPLOY-data"; do
+    grep -qF -- "$pat" "$YAML" || missing+=("$pat")
+  done
+  if (( ${#missing[@]} == 0 )); then
+    return 0
+  fi
+  echo "✗ FATAL: the generated manifest $YAML is INCOMPLETE — missing:" >&2
+  printf '    %s\n' "${missing[@]}" >&2
+  echo "  The manifest body is an unquoted heredoc, so bash expands command" >&2
+  echo "  substitutions and backticks in it — including inside YAML comments." >&2
+  echo "  A stray or backslash-unescaped one silently EXECUTES a command and" >&2
+  echo "  eats part of the file. Fix the template and re-run; nothing was applied." >&2
+  return 1
+}
+_manifest_check || exit 1
+
 echo "→ YAML written: $YAML"
 
 # ── Import images into containerd ─────────────────────────────────────────────
