@@ -25,8 +25,8 @@ python3 /opt/comm-tools/message_agent.py <sibling> "<prompt>" [flags]
 ```
 
 ```sh
-python3 /opt/comm-tools/message_agent.py fa-glm-l "Who are you?"          # direct: send + wait
-python3 /opt/comm-tools/message_agent.py fa-glm-l "hi" --mode inbox       # enqueue, id back now
+python3 /opt/comm-tools/message_agent.py fa-glm-l "Who are you?"          # inbox (default): enqueue, id back now
+python3 /opt/comm-tools/message_agent.py fa-glm-l "hi" --mode direct      # opt-in: send + wait for the reply
 python3 /opt/comm-tools/message_agent.py fa-glm-l "hi" --new-chat         # fresh conversation
 python3 /opt/comm-tools/message_agent.py fa-glm-l "hi" --json             # structured reply
 python3 /opt/comm-tools/message_agent.py fa-glm-l "do X" --source me      # tag for grouping
@@ -38,20 +38,23 @@ python3 /opt/comm-tools/message_agent.py fa-glm-l "do X" --source me      # tag 
 |---|---|---|
 | `sibling` (positional) | — | which sibling to message, by bare name (the `sibling` field off `list-siblings`). |
 | `prompt` (positional) | — | the message text to send. |
-| `--mode` | `direct` | `direct` = send and WAIT for the full reply (no timeout, long jobs fine). `inbox` = enqueue and return a message `id` immediately; fetch later via the sibling's queue-status. |
+| `--mode` | `inbox` | `inbox` = send and return a message `id` immediately (fire-and-forget; fetch later via the sibling's queue-status). `direct` = send and WAIT for the full reply (no timeout) — explicit opt-in for when you need the answer now. |
 | `--new-chat` | off | **planners only.** Start a fresh conversation instead of resuming. Ignored for engineers. |
 | `--json` | off | Structured reply — planners return a JSON object; engineers pretty-print valid JSON (else raw text). |
 | `--source` | none | a stable tag (e.g. your own name) so the recipient groups your messages together — the group-by-source ordering rule. |
 
 ## Direct vs inbox
 
-- **direct (default)** — enqueue and WAIT for the full reply. No timeout: a long
-  job is fine, you get the whole answer back however long it takes.
-- **inbox** — enqueue and return a message `id` immediately (it does NOT block).
-  Fetch the result later, by id, via the sibling's `*_queue_status` tool.
+- **inbox (default)** — enqueue and return a message `id` immediately (it does
+  NOT block). Fetch the result later, by id, via the sibling's
+  `*_queue_status` tool. Fire-and-forget: the caller comes straight back.
+- **direct (explicit opt-in)** — enqueue and WAIT for the full reply. No
+  timeout: a long job is fine, you get the whole answer back however long it
+  takes.
 
-`direct` is the "do this and tell me" mode; `inbox` is the "kick this off, I'll
-check back" mode for anything long or backgrounded.
+`inbox` is the default "kick this off, I'll check back" mode; `direct` is the
+opt-in "do this and tell me" mode for when you genuinely need the full reply
+now.
 
 ## Planner vs engineer (the one behavioral split)
 

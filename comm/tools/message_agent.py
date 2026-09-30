@@ -7,8 +7,9 @@ Interface: tests/comm_tools.py (`Fleet`, `message_agent`, `queue_status`), pinne
            by tests/test_message_agent.py
 
 Usage
-    python3 tools/message_agent.py caesar "say hi"                   # direct (send + wait)
-    python3 tools/message_agent.py marc "do a long task" --mode inbox  # enqueue, get an id
+    python3 tools/message_agent.py caesar "say hi"                    # inbox (default): enqueue, get an id
+    python3 tools/message_agent.py marc "do a long task"              # same: fire-and-forget
+    python3 tools/message_agent.py marc "hi" --mode direct            # opt-in: wait for the full reply
     python3 tools/message_agent.py marc "hi" --new-chat --source me   # fresh convo, tagged
     python3 tools/message_agent.py caesar "hi" --json                 # structured reply
     python3 tools/message_agent.py marc --queue                       # read the recipient's inbox
@@ -32,10 +33,12 @@ machinery rather than reimplementing it:
     Deployment's ``app`` label (sudo-letta | sudo-agent), because the two kinds
     expose different prompt tools -- see LiveFleet (shared with check-agent).
 
-Direct mode is the default and must never cut a long job (the contract's
-"no timeout"), so the transport's per-call timeout is generous by default. A
-down sidecar still fails fast: "connection refused" is immediate, and the
-bounded retry (not this timeout) is what bounds the failure path.
+Inbox mode is the default (fire-and-forget: enqueue + return an id). Direct
+mode is the explicit opt-in that waits for the full reply, and it must never
+cut a long job (the contract's "no timeout"), so the transport's per-call
+timeout is generous by default. A down sidecar still fails fast: "connection
+refused" is immediate, and the bounded retry (not this timeout) is what bounds
+the failure path.
 
 One live-cluster adaptation: the reference `comm_tools.message_agent` uses
 `source=None` as its "not given" sentinel, but the shipped prompt tools declare
@@ -99,7 +102,7 @@ def live_fleet(transport=None, **transport_kwargs):
 
 # --- the tool ---------------------------------------------------------------
 
-def message_agent_live(sibling, prompt, mode="direct", new_chat=False, json=False,
+def message_agent_live(sibling, prompt, mode="inbox", new_chat=False, json=False,
                        source=None, *, fleet=None):
     """Message a sibling on the LIVE fleet (the call the tool makes).
 
@@ -149,9 +152,9 @@ def main(argv=None, fleet_factory=None):
                         help="sibling agent name (bare), e.g. caesar or marc")
     parser.add_argument("prompt", nargs="?", default=None,
                         help="the message text to send (omit with --queue)")
-    parser.add_argument("--mode", choices=("direct", "inbox"), default="direct",
-                        help="direct (default) = send + wait; "
-                             "inbox = enqueue + return an id immediately")
+    parser.add_argument("--mode", choices=("direct", "inbox"), default="inbox",
+                        help="inbox (default) = send + return an id immediately; "
+                             "direct = wait for the full reply (explicit opt-in)")
     parser.add_argument("--new-chat", action="store_true",
                         help="start a fresh conversation (planners only; "
                              "ignored for engineers)")
