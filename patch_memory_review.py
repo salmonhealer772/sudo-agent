@@ -6,16 +6,18 @@ PATH = "/opt/hermes/agent/background_review.py"
 with open(PATH) as f:
     code = f.read()
 
-# Anchor on the STRUCTURAL line that marks the start of the review worker's
-# body (``st = _ReviewForkState()``), NOT on a comment. The old anchor
-# (``# Silence stdout/stderr for THIS worker thread only.``) bit-rotted: the
-# base image reworded that comment, so the patch silently printed
-# "ERROR: Could not find insertion point" and shipped an UNPATCHED image.
-# This anchor is unique in the file (verified: 1 occurrence) and stable across
-# base-image comment churn.
-old = "    st = _ReviewForkState()\n"
+# The review worker `_run_review_in_thread` opens with two local imports that
+# avoid a hard circular dep at module load. That import block is the first
+# executable statement of the function body and is stable code (not a comment),
+# so it survives the base-image churn that bit-rotted the earlier anchors:
+#   * "    st = _ReviewForkState()\n"  -> gone (worker refactored, no fork-state line)
+#   * "# Silence stdout/stderr ..."    -> comment, reworded by upstream
+# We insert the auto-save block immediately AFTER the local imports, before the
+# fork is built, so the parent agent's real memory store captures the user's
+# latest message on every background review.
+old = "    from tools.terminal_tool import set_approval_callback as _set_approval_callback\n"
 
-new = """    st = _ReviewForkState()
+new = """    from tools.terminal_tool import set_approval_callback as _set_approval_callback
     # ---- PROGRAMMATIC AUTO-SAVE: save every user message to memory ----
     try:
         store = agent._memory_store
@@ -34,7 +36,7 @@ new = """    st = _ReviewForkState()
 """
 
 if old in code:
-    if new in code:
+    if "PROGRAMMATIC AUTO-SAVE" in code:
         print("Already patched (auto-save present) — no-op")
     else:
         code = code.replace(old, new, 1)
@@ -45,5 +47,5 @@ else:
     # FAIL LOUD: a silently unpatched image would ship without save-every-message
     # memory. The Dockerfile runs this script with `&& rm`, so a non-zero exit
     # aborts the build instead of quietly producing an unpatched agent.
-    print("ERROR: Could not find insertion point (anchor: 'st = _ReviewForkState()') in %s" % PATH, file=sys.stderr)
+    print("ERROR: Could not find insertion point (anchor: 'from tools.terminal_tool import set_approval_callback') in %s" % PATH, file=sys.stderr)
     sys.exit(1)
